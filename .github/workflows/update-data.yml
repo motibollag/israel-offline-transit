@@ -1,0 +1,93 @@
+name: Update Israeli Transit Data
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: transit-data-update
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Get project files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download official transport data
+        run: |
+          mkdir -p build/source build/output
+
+          curl -fL --retry 3 \
+            "https://gtfs.mot.gov.il/gtfsfiles/israel-public-transportation.zip" \
+            -o build/source/israel-public-transportation.zip
+
+          curl -fL --retry 3 \
+            "https://gtfs.mot.gov.il/gtfsfiles/RouteNetworksByDate_10_Days.zip" \
+            -o build/source/RouteNetworksByDate_10_Days.zip
+
+      - name: Verify downloaded ZIP files
+        run: |
+          python -m zipfile -t build/source/israel-public-transportation.zip
+          python -m zipfile -t build/source/RouteNetworksByDate_10_Days.zip
+
+      - name: Build SQLite database
+        run: |
+          python scripts/build_data.py \
+            --gtfs build/source/israel-public-transportation.zip \
+            --networks build/source/RouteNetworksByDate_10_Days.zip \
+            --output build/output/israel-transit.sqlite
+
+      - name: Verify database
+        run: |
+          test -s build/output/israel-transit.sqlite
+          python -c "import sqlite3; c=sqlite3.connect('build/output/israel-transit.sqlite'); print('SQLite integrity:', c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
+
+      - name: Publish new data release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="data-$(date -u +%Y%m%d-%H%M%S)"
+
+          gh release create "$TAG" \
+            build/output/israel-transit.sqlite \
+            --title "Transit data $TAG" \
+            --notes "Automatically generated from official Ministry of Transport data."
+
+          gh release view "$TAG" \
+            --json assets \
+            --jq '.assets[] | select(.name == "israel-transit.sqlite") | .name' \
+            | grep -Fx "israel-transit.sqlite"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Delete older releases after successful publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEW_TAG="${{ steps.publish.outputs.tag }}"
+
+          gh release list --limit 100 --json tagName \
+            --jq '.[].tagName' |
+          while read -r OLD_TAG; do
+            if [ -n "$OLD_TAG" ] && [ "$OLD_TAG" != "$NEW_TAG" ]; then
+              gh release delete "$OLD_TAG" --yes --cleanup-tag
+            fi
+          done
+
+      - name: Remove temporary build files
+        if: always()
+        run: rm -rf build
