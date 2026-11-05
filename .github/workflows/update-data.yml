@@ -53,37 +53,46 @@ jobs:
       - name: Verify database
         run: |
           test -s build/output/israel-transit.sqlite
-          python -c "import sqlite3; c=sqlite3.connect('build/output/israel-transit.sqlite'); print('SQLite integrity:', c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
+          python -c "import sqlite3; c=sqlite3.connect('build/output/israel-transit.sqlite'); print(c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
 
       - name: Publish new data release
         id: publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="data-$(date -u +%Y%m%d-%H%M%S)"
+          TAG="transit-data-$(date -u +%Y%m%d-%H%M%S)"
 
           gh release create "$TAG" \
             build/output/israel-transit.sqlite \
             --title "Transit data $TAG" \
             --notes "Automatically generated from official Ministry of Transport data."
 
-          gh release view "$TAG" \
+          VERIFIED=$(gh release view "$TAG" \
             --json assets \
-            --jq '.assets[] | select(.name == "israel-transit.sqlite") | .name' \
-            | grep -Fx "israel-transit.sqlite"
+            --jq '[.assets[] | select(.name == "israel-transit.sqlite")] | length')
+
+          if [ "$VERIFIED" != "1" ]; then
+            echo "Release asset verification failed."
+            exit 1
+          fi
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Delete older releases after successful publication
+      - name: Delete older transit-data releases only
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           NEW_TAG="${{ steps.publish.outputs.tag }}"
 
-          gh release list --limit 100 --json tagName \
-            --jq '.[].tagName' |
-          while read -r OLD_TAG; do
-            if [ -n "$OLD_TAG" ] && [ "$OLD_TAG" != "$NEW_TAG" ]; then
+          mapfile -t OLD_TAGS < <(
+            gh release list --limit 100 --json tagName \
+              --jq '.[].tagName' |
+            grep '^transit-data-' || true
+          )
+
+          for OLD_TAG in "${OLD_TAGS[@]}"; do
+            if [ "$OLD_TAG" != "$NEW_TAG" ]; then
+              echo "Deleting old transit-data release: $OLD_TAG"
               gh release delete "$OLD_TAG" --yes --cleanup-tag
             fi
           done
