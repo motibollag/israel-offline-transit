@@ -61,6 +61,192 @@ jobs:
             --networks build/source/RouteNetworksByDate_10_Days.zip \
             --output build/output/israel-transit.sqlite
 
+      - name: Validate calendar and trip services
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import sqlite3
+          from datetime import datetime, timedelta
+          from pathlib import Path
+
+          path = Path("build/output/israel-transit.sqlite")
+          db = sqlite3.connect(path)
+          db.row_factory = sqlite3.Row
+
+          def columns(table):
+              return {
+                  row["name"]
+                  for row in db.execute(f'PRAGMA table_info("{table}")')
+              }
+
+          required_calendar_columns = {
+              "service_id",
+              "sunday", "monday", "tuesday", "wednesday",
+              "thursday", "friday", "saturday",
+              "start_date", "end_date"
+          }
+
+          calendar_columns = columns("calendar")
+          missing_columns = required_calendar_columns - calendar_columns
+
+          if missing_columns:
+              raise SystemExit(
+                  "calendar is missing columns: "
+                  + ", ".join(sorted(missing_columns))
+              )
+
+          trip_columns = columns("trips")
+          if "service_id" not in trip_columns:
+              raise SystemExit("trips is missing service_id")
+
+          weekday_columns = [
+              "monday", "tuesday", "wednesday",
+              "thursday", "friday", "saturday", "sunday"
+          ]
+
+          calendar_rows = db.execute("""
+              SELECT service_id, sunday, monday, tuesday,
+                     wednesday, thursday, friday, saturday,
+                     start_date, end_date
+              FROM calendar
+          """).fetchall()
+
+          print(f"Calendar services: {len(calendar_rows):,}")
+
+          errors = []
+          warnings = []
+          seen_ids = set()
+          inactive_services = []
+
+          for row in calendar_rows:
+              service_id = row["service_id"]
+
+              if service_id in seen_ids:
+                  errors.append(
+                      f"Duplicate calendar service_id: {service_id}"
+                  )
+              seen_ids.add(service_id)
+
+              try:
+                  start = datetime.strptime(
+                      str(row["start_date"]), "%Y%m%d"
+                  ).date()
+                  end = datetime.strptime(
+                      str(row["end_date"]), "%Y%m%d"
+                  ).date()
+              except (ValueError, TypeError):
+                  errors.append(
+                      f"Invalid date for service_id {service_id}: "
+                      f"{row['start_date']} - {row['end_date']}"
+                  )
+                  continue
+
+              if start > end:
+                  errors.append(
+                      f"start_date is after end_date for service_id "
+                      f"{service_id}"
+                  )
+                  continue
+
+              active_days = []
+
+              for column in weekday_columns:
+                  value = str(row[column])
+                  if value not in ("0", "1"):
+                      errors.append(
+                          f"Invalid {column} value for service_id "
+                          f"{service_id}: {value}"
+                      )
+                  elif value == "1":
+                      active_days.append(column)
+
+              if not active_days:
+                  inactive_services.append(service_id)
+                  continue
+
+              active_weekdays = {
+                  "monday": 0,
+                  "tuesday": 1,
+                  "wednesday": 2,
+                  "thursday": 3,
+                  "friday": 4,
+                  "saturday": 5,
+                  "sunday": 6
+              }
+
+              active_weekday_numbers = {
+                  active_weekdays[day] for day in active_days
+              }
+
+              current = start
+              has_active_date = False
+
+              while current <= end:
+                  if current.weekday() in active_weekday_numbers:
+                      has_active_date = True
+                      break
+                  current += timedelta(days=1)
+
+              if not has_active_date:
+                  inactive_services.append(service_id)
+
+          missing_services = db.execute("""
+              SELECT DISTINCT t.service_id
+              FROM trips t
+              LEFT JOIN calendar c
+                  ON t.service_id = c.service_id
+              WHERE c.service_id IS NULL
+              LIMIT 100
+          """).fetchall()
+
+          missing_count = db.execute("""
+              SELECT COUNT(DISTINCT t.service_id)
+              FROM trips t
+              LEFT JOIN calendar c
+                  ON t.service_id = c.service_id
+              WHERE c.service_id IS NULL
+          """).fetchone()[0]
+
+          print("\nSERVICE VALIDATION REPORT")
+
+          if missing_count:
+              print(
+                  f"ERROR: {missing_count:,} service_id values "
+                  "in trips are missing from calendar."
+              )
+              for row in missing_services:
+                  print(f"  Missing service_id: {row['service_id']}")
+              errors.append(
+                  f"{missing_count} trip service IDs have no calendar entry"
+              )
+          else:
+              print("All trip service IDs exist in calendar.")
+
+          if inactive_services:
+              print(
+                  f"\nWARNING: {len(inactive_services):,} services "
+                  "have no active date in their date range."
+              )
+              for service_id in inactive_services[:30]:
+                  print(f"  Inactive service_id: {service_id}")
+              if len(inactive_services) > 30:
+                  print("  Additional services omitted from this report.")
+          else:
+              print("All calendar services have at least one active date.")
+
+          if errors:
+              print("\nVALIDATION FAILED:")
+              for error in errors:
+                  print(f"  - {error}")
+              db.close()
+              raise SystemExit(1)
+
+          print("\nCalendar and trip service validation successful.")
+          db.close()
+          PY
+
       - name: Verify database and report table sizes
         shell: bash
         run: |
