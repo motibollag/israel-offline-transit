@@ -2,8 +2,18 @@
 """
 Build an offline Israeli public-transport SQLite database.
 
-All imported GTFS values are stored as TEXT. This is intentional:
-GTFS times can exceed 24 hours (for example, 25:10:00).
+All source files, tables and columns are imported.
+Only selected fields are stored using compact numeric types:
+
+stop_times.arrival_time       -> INTEGER seconds from service-day start
+stop_times.departure_time     -> INTEGER seconds from service-day start
+stop_times.stop_sequence      -> INTEGER
+shapes.shape_pt_sequence      -> INTEGER
+
+All identifiers, names, coordinates and other values remain TEXT.
+
+GTFS times above 24:00 are preserved as seconds from the start
+of the service day. Example: 25:10:00 = 90600 seconds.
 """
 
 import argparse
@@ -25,14 +35,18 @@ REQUIRED_GTFS_TABLES = {
     "stop_times",
 }
 
-OPTIONAL_GTFS_TABLES = {
-    "calendar_dates",
-    "calendar",
-    "shapes",
-    "frequencies",
-    "transfers",
-    "feed_info",
-    "translations",
+# Only these explicitly understood fields are converted.
+# All other fields, including fields added in future feeds, remain TEXT.
+INTEGER_COLUMNS = {
+    ("stop_times", "stop_sequence"),
+    ("shapes", "shape_pt_sequence"),
+    ("stop_times", "arrival_time"),
+    ("stop_times", "departure_time"),
+}
+
+TIME_COLUMNS = {
+    ("stop_times", "arrival_time"),
+    ("stop_times", "departure_time"),
 }
 
 
@@ -48,6 +62,7 @@ def clean_column_names(columns):
 
     for index, column in enumerate(columns):
         name = (column or "").strip().lstrip("\ufeff")
+
         if not name:
             name = f"column_{index + 1}"
 
@@ -71,19 +86,27 @@ def clean_column_names(columns):
 
 def decode_csv_bytes(data):
     """Decode common encodings used in downloaded CSV files."""
-    for encoding in ("utf-8-sig", "utf-8", "cp1255", "windows-1252"):
+    for encoding in (
+        "utf-8-sig",
+        "utf-8",
+        "cp1255",
+        "windows-1252",
+    ):
         try:
             return data.decode(encoding)
         except UnicodeDecodeError:
             continue
 
-    raise ValueError("Could not decode a CSV file using supported encodings")
+    raise ValueError(
+        "Could not decode a CSV file using supported encodings"
+    )
 
 
 def find_csv_files(zip_path):
     """Yield CSV/TXT files from a ZIP archive."""
     with zipfile.ZipFile(zip_path, "r") as archive:
         bad_member = archive.testzip()
+
         if bad_member:
             raise ValueError(f"Damaged ZIP member: {bad_member}")
 
@@ -92,6 +115,7 @@ def find_csv_files(zip_path):
                 continue
 
             suffix = Path(member).suffix.lower()
+
             if suffix not in (".txt", ".csv"):
                 continue
 
@@ -103,15 +127,88 @@ def table_name_from_member(member, prefix=""):
     stem = re.sub(r"[^a-z0-9_]", "_", stem)
 
     if not stem:
-        raise ValueError(f"Invalid table name from file: {member}")
+        raise ValueError(
+            f"Invalid table name from file: {member}"
+        )
 
     return prefix + stem
 
 
+def parse_gtfs_time(value, table_name, column_name, row_number):
+    """
+    Convert GTFS HH:MM:SS or H:MM:SS to seconds.
+
+    Hours above 24 are deliberately supported.
+    Empty values remain empty strings.
+    """
+    if value == "":
+        return ""
+
+    match = re.fullmatch(
+        r"([0-9]{1,3}):([0-5][0-9]):([0-5][0-9])",
+        value.strip(),
+    )
+
+    if not match:
+        raise ValueError(
+            f"Invalid GTFS time in {table_name}.{column_name}, "
+            f"row {row_number}: {value!r}"
+        )
+
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def parse_nonnegative_integer(
+    value,
+    table_name,
+    column_name,
+    row_number,
+):
+    """Convert an integer field without silently changing its value."""
+    if value == "":
+        return ""
+
+    if not re.fullmatch(r"[0-9]+", value.strip()):
+        raise ValueError(
+            f"Invalid non-negative integer in "
+            f"{table_name}.{column_name}, "
+            f"row {row_number}: {value!r}"
+        )
+
+    return int(value)
+
+
+def convert_value(table_name, column_name, value, row_number):
+    """Convert only fields explicitly listed above."""
+    key = (table_name, column_name.lower())
+
+    if key in TIME_COLUMNS:
+        return parse_gtfs_time(
+            value,
+            table_name,
+            column_name,
+            row_number,
+        )
+
+    if key in INTEGER_COLUMNS:
+        return parse_nonnegative_integer(
+            value,
+            table_name,
+            column_name,
+            row_number,
+        )
+
+    return value
+
+
 def import_csv(connection, table_name, data):
-    """Import one CSV file into a TEXT-only SQLite table."""
+    """Import one CSV file, preserving every source column."""
     text_data = decode_csv_bytes(data)
-    reader = csv.reader(io.StringIO(text_data))
+    reader = csv.reader(io.StringIO(text_data, newline=""))
 
     try:
         headers = next(reader)
@@ -125,19 +222,31 @@ def import_csv(connection, table_name, data):
         raise ValueError(f"No columns found in {table_name}")
 
     quoted_table = quote_identifier(table_name)
-    quoted_columns = ", ".join(quote_identifier(c) for c in columns)
+    quoted_columns = ", ".join(
+        quote_identifier(column) for column in columns
+    )
+
+    definitions = []
+
+    for column in columns:
+        key = (table_name, column.lower())
+
+        if key in INTEGER_COLUMNS:
+            column_type = "INTEGER"
+        else:
+            column_type = "TEXT"
+
+        definitions.append(
+            f"{quote_identifier(column)} {column_type}"
+        )
 
     connection.execute(
         f"DROP TABLE IF EXISTS {quoted_table}"
     )
 
-    definitions = ", ".join(
-        f"{quote_identifier(column)} TEXT"
-        for column in columns
-    )
-
     connection.execute(
-        f"CREATE TABLE {quoted_table} ({definitions})"
+        f"CREATE TABLE {quoted_table} "
+        f"({', '.join(definitions)})"
     )
 
     placeholders = ", ".join("?" for _ in columns)
@@ -156,13 +265,26 @@ def import_csv(connection, table_name, data):
 
         if len(row) < len(columns):
             row.extend([""] * (len(columns) - len(row)))
+
         elif len(row) > len(columns):
             raise ValueError(
                 f"Unexpected extra columns in {table_name}, "
                 f"row {row_count + 2}"
             )
 
-        batch.append(row)
+        converted_row = []
+
+        for index, value in enumerate(row):
+            converted_row.append(
+                convert_value(
+                    table_name,
+                    columns[index],
+                    value,
+                    row_count + 2,
+                )
+            )
+
+        batch.append(converted_row)
         row_count += 1
 
         if len(batch) >= 5000:
@@ -179,19 +301,46 @@ def import_csv(connection, table_name, data):
 def create_indexes(connection):
     """Create useful indexes when the relevant columns exist."""
     indexes = {
-        "idx_stops_stop_id": ("stops", ["stop_id"]),
-        "idx_stops_stop_name": ("stops", ["stop_name"]),
-        "idx_routes_route_id": ("routes", ["route_id"]),
-        "idx_routes_route_short_name": ("routes", ["route_short_name"]),
-        "idx_routes_agency_id": ("routes", ["agency_id"]),
-        "idx_trips_trip_id": ("trips", ["trip_id"]),
-        "idx_trips_route_id": ("trips", ["route_id"]),
-        "idx_trips_service_id": ("trips", ["service_id"]),
+        "idx_stops_stop_id": (
+            "stops",
+            ["stop_id"],
+        ),
+        "idx_stops_stop_name": (
+            "stops",
+            ["stop_name"],
+        ),
+        "idx_routes_route_id": (
+            "routes",
+            ["route_id"],
+        ),
+        "idx_routes_route_short_name": (
+            "routes",
+            ["route_short_name"],
+        ),
+        "idx_routes_agency_id": (
+            "routes",
+            ["agency_id"],
+        ),
+        "idx_trips_trip_id": (
+            "trips",
+            ["trip_id"],
+        ),
+        "idx_trips_route_id": (
+            "trips",
+            ["route_id"],
+        ),
+        "idx_trips_service_id": (
+            "trips",
+            ["service_id"],
+        ),
         "idx_stop_times_trip_sequence": (
             "stop_times",
             ["trip_id", "stop_sequence"],
         ),
-        "idx_stop_times_stop_id": ("stop_times", ["stop_id"]),
+        "idx_stop_times_stop_id": (
+            "stop_times",
+            ["stop_id"],
+        ),
         "idx_calendar_dates_service": (
             "calendar_dates",
             ["service_id", "date"],
@@ -217,7 +366,8 @@ def create_indexes(connection):
 
         if all(column in existing_columns for column in columns):
             column_sql = ", ".join(
-                quote_identifier(column) for column in columns
+                quote_identifier(column)
+                for column in columns
             )
 
             connection.execute(
@@ -225,6 +375,59 @@ def create_indexes(connection):
                 f"{quote_identifier(index_name)} "
                 f"ON {quote_identifier(table)} ({column_sql})"
             )
+
+
+def verify_converted_columns(connection, imported_tables):
+    """Verify that converted columns have the expected SQLite types."""
+    expected = {
+        "stop_times": {
+            "arrival_time",
+            "departure_time",
+            "stop_sequence",
+        },
+        "shapes": {
+            "shape_pt_sequence",
+        },
+    }
+
+    for table, required_columns in expected.items():
+        if table not in imported_tables:
+            continue
+
+        column_info = {
+            row[1]: row[2].upper()
+            for row in connection.execute(
+                f"PRAGMA table_info({quote_identifier(table)})"
+            )
+        }
+
+        for column in required_columns:
+            if column not in column_info:
+                continue
+
+            if column_info[column] != "INTEGER":
+                raise RuntimeError(
+                    f"Unexpected type for {table}.{column}: "
+                    f"{column_info[column]}"
+                )
+
+    # Verify that converted time values are actually stored as integers.
+    if "stop_times" in imported_tables:
+        for column in ("arrival_time", "departure_time"):
+            result = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM stop_times
+                WHERE {quote_identifier(column)} != ''
+                  AND typeof({quote_identifier(column)}) != 'integer'
+                """
+            ).fetchone()[0]
+
+            if result:
+                raise RuntimeError(
+                    f"{result:,} non-integer values found in "
+                    f"stop_times.{column}"
+                )
 
 
 def main():
@@ -241,7 +444,9 @@ def main():
     output_path = Path(args.output)
 
     if not gtfs_path.is_file():
-        raise FileNotFoundError(f"GTFS ZIP not found: {gtfs_path}")
+        raise FileNotFoundError(
+            f"GTFS ZIP not found: {gtfs_path}"
+        )
 
     if not networks_path.is_file():
         raise FileNotFoundError(
@@ -308,8 +513,10 @@ def main():
 
         if "calendar_dates" not in imported_gtfs:
             print(
-                "WARNING: calendar_dates.txt was not found. "
-                "Check the current official feed specification."
+                "NOTICE: calendar_dates.txt was not found. "
+                "The imported calendar table, if present, "
+                "has been preserved. Check the current feed "
+                "specification before interpreting service dates."
             )
 
         metadata = {
@@ -318,15 +525,33 @@ def main():
             "networks_source": networks_path.name,
             "gtfs_tables": ",".join(sorted(imported_gtfs)),
             "networks_tables": ",".join(sorted(imported_networks)),
-            "format_version": "1",
+            "format_version": "2",
+            "time_encoding": "seconds_since_service_day_start",
+            "time_columns": (
+                "stop_times.arrival_time,"
+                "stop_times.departure_time"
+            ),
+            "integer_columns": (
+                "stop_times.stop_sequence,"
+                "shapes.shape_pt_sequence"
+            ),
+            "source_columns_preserved": "true",
+            "source_tables_preserved": "true",
         }
 
         connection.executemany(
-            "INSERT INTO import_metadata (key, value) VALUES (?, ?)",
+            "INSERT INTO import_metadata (key, value) "
+            "VALUES (?, ?)",
             metadata.items(),
         )
 
         create_indexes(connection)
+
+        verify_converted_columns(
+            connection,
+            imported_gtfs,
+        )
+
         connection.commit()
 
         integrity = connection.execute(
@@ -339,8 +564,12 @@ def main():
             )
 
         print("SQLite integrity check: OK")
+        print("Converted-column verification: OK")
         print(f"Database created: {output_path}")
-        print(f"Database size: {output_path.stat().st_size:,} bytes")
+        print(
+            f"Database size: "
+            f"{output_path.stat().st_size:,} bytes"
+        )
 
     except Exception:
         connection.rollback()
@@ -354,5 +583,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print(f"BUILD FAILED: {error}", file=sys.stderr)
+        print(
+            f"BUILD FAILED: {error}",
+            file=sys.stderr,
+        )
         sys.exit(1)
