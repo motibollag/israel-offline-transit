@@ -72,7 +72,6 @@ jobs:
           python - <<'PY'
           import sqlite3
           from datetime import datetime, timedelta
-          from pathlib import Path
 
           db = sqlite3.connect(
               "build/output/israel-transit.sqlite"
@@ -165,8 +164,6 @@ jobs:
                   inactive.append(sid)
                   continue
 
-              # If the range covers at least seven days,
-              # every weekday occurs in it.
               if (end - start).days >= 6:
                   has_active_date = True
               else:
@@ -214,7 +211,7 @@ jobs:
           db.close()
           PY
 
-      - name: Investigate selected services
+      - name: Investigate selected services and trips
         shell: bash
         env:
           SERVICE_IDS: ${{ inputs.service_ids }}
@@ -225,62 +222,233 @@ jobs:
           import os
           import sqlite3
 
-          raw_ids = os.environ.get("SERVICE_IDS", "")
+          db = sqlite3.connect(
+              "build/output/israel-transit.sqlite"
+          )
+          db.row_factory = sqlite3.Row
+
           service_ids = [
               item.strip()
-              for item in raw_ids.split(",")
+              for item in os.environ.get(
+                  "SERVICE_IDS", ""
+              ).split(",")
               if item.strip()
           ]
 
           if not service_ids:
               print("No service IDs selected.")
+              db.close()
               raise SystemExit(0)
 
-          db = sqlite3.connect(
-              "build/output/israel-transit.sqlite"
-          )
+          def get_columns(table):
+              return {
+                  row["name"]
+                  for row in db.execute(
+                      f'PRAGMA table_info("{table}")'
+                  )
+              }
 
-          placeholders = ",".join("?" for _ in service_ids)
+          def expression(alias, available, column, fallback="NULL"):
+              if column in available:
+                  return f'{alias}."{column}"'
+              return fallback
 
-          query = f"""
-              SELECT
-                  c.service_id,
-                  c.start_date,
-                  c.end_date,
-                  c.sunday,
-                  c.monday,
-                  c.tuesday,
-                  c.wednesday,
-                  c.thursday,
-                  c.friday,
-                  c.saturday,
-                  COUNT(DISTINCT t.trip_id) AS trip_count,
-                  COUNT(st.trip_id) AS stop_time_count
-              FROM calendar c
-              LEFT JOIN trips t
-                  ON t.service_id = c.service_id
-              LEFT JOIN stop_times st
-                  ON st.trip_id = t.trip_id
-              WHERE c.service_id IN ({placeholders})
-              GROUP BY c.service_id
-              ORDER BY c.service_id
+          tables = {
+              row["name"]
+              for row in db.execute("""
+                  SELECT name
+                  FROM sqlite_master
+                  WHERE type='table'
+              """)
+          }
+
+          for table in ["calendar", "trips", "routes",
+                        "agency", "stops", "stop_times"]:
+              if table not in tables:
+                  raise SystemExit(f"Missing table: {table}")
+
+          tc = get_columns("trips")
+          rc = get_columns("routes")
+          ac = get_columns("agency")
+          sc = get_columns("stops")
+          stc = get_columns("stop_times")
+
+          selected = ",".join("?" for _ in service_ids)
+
+          print("\n========== SELECTED SERVICE DETAILS ==========")
+
+          calendar_query = f"""
+              SELECT *
+              FROM calendar
+              WHERE service_id IN ({selected})
+              ORDER BY service_id
           """
 
-          print(
-              "service_id | start | end | sun mon tue wed thu fri sat "
-              "| trips | stop_times"
-          )
+          for row in db.execute(calendar_query, service_ids):
+              print("\nCALENDAR:")
+              print(dict(row))
 
-          found = set()
+          print("\n========== ROUTES AND OPERATORS ==========")
 
-          for row in db.execute(query, service_ids):
-              found.add(str(row[0]))
-              print(" | ".join(str(value) for value in row))
+          trip_fields = [
+              "trip_id", "service_id", "route_id",
+              "direction_id", "trip_headsign", "shape_id"
+          ]
 
-          for sid in service_ids:
-              if sid not in found:
-                  print(f"{sid} | NOT FOUND IN CALENDAR")
+          route_fields = [
+              "route_short_name", "route_long_name",
+              "route_type", "agency_id"
+          ]
 
+          agency_fields = [
+              "agency_name", "agency_url", "agency_id"
+          ]
+
+          select_parts = [
+              expression("t", tc, col) + f' AS "{col}"'
+              for col in trip_fields
+          ]
+
+          select_parts += [
+              expression("r", rc, col) + f' AS "route_{col}"'
+              for col in route_fields
+          ]
+
+          select_parts += [
+              expression("a", ac, col) + f' AS "{col}"'
+              for col in agency_fields
+          ]
+
+          query = f"""
+              SELECT {", ".join(select_parts)}
+              FROM trips t
+              LEFT JOIN routes r
+                ON r.route_id = t.route_id
+              LEFT JOIN agency a
+                ON a.agency_id = r.agency_id
+              WHERE t.service_id IN ({selected})
+              ORDER BY t.service_id, t.route_id, t.trip_id
+          """
+
+          trips = db.execute(query, service_ids).fetchall()
+
+          print(f"Selected trips: {len(trips):,}")
+
+          route_ids = set()
+
+          for row in trips:
+              item = dict(row)
+              route_ids.add(item.get("route_id"))
+
+              print("\nTRIP:")
+              for key, value in item.items():
+                  if value is not None:
+                      print(f"  {key}: {value}")
+
+          print("\n========== FIRST AND LAST STOPS ==========")
+
+          if not {"trip_id", "stop_id", "stop_sequence"}.issubset(stc):
+              print("Required stop_times columns are missing.")
+          else:
+              for trip in trips:
+                  trip_id = trip["trip_id"]
+
+                  first = db.execute("""
+                      SELECT st.*, s.stop_name
+                      FROM stop_times st
+                      LEFT JOIN stops s ON s.stop_id = st.stop_id
+                      WHERE st.trip_id = ?
+                      ORDER BY st.stop_sequence ASC
+                      LIMIT 1
+                  """, (trip_id,)).fetchone()
+
+                  last = db.execute("""
+                      SELECT st.*, s.stop_name
+                      FROM stop_times st
+                      LEFT JOIN stops s ON s.stop_id = st.stop_id
+                      WHERE st.trip_id = ?
+                      ORDER BY st.stop_sequence DESC
+                      LIMIT 1
+                  """, (trip_id,)).fetchone()
+
+                  print(f"\nTRIP {trip_id}")
+
+                  for label, stop in [
+                      ("FIRST", first), ("LAST", last)
+                  ]:
+                      if stop is None:
+                          print(f"  {label}: NO STOP TIMES")
+                          continue
+
+                      print(f"  {label}:")
+                      print(f"    stop_id: {stop['stop_id']}")
+                      print(f"    stop_name: {stop['stop_name']}")
+                      print(f"    stop_sequence: {stop['stop_sequence']}")
+
+                      for time_col in [
+                          "arrival_time", "departure_time"
+                      ]:
+                          if time_col in stc:
+                              value = stop[time_col]
+                              print(f"    {time_col}: {value}")
+
+          print("\n========== ROUTE NETWORK TABLES ==========")
+
+          network_tables = [
+              name for name in sorted(tables)
+              if "network" in name.lower()
+              or "routenetwork" in name.lower()
+              or "cluster" in name.lower()
+          ]
+
+          if not network_tables:
+              print("No route network tables found.")
+          else:
+              for table in network_tables:
+                  print(f"\nTABLE: {table}")
+
+                  cols = get_columns(table)
+                  print("COLUMNS:", ", ".join(sorted(cols)))
+
+                  route_key = next(
+                      (c for c in [
+                          "route_id", "routeid",
+                          "route", "line_id", "lineid"
+                      ] if c in cols),
+                      None
+                  )
+
+                  rows = []
+
+                  if route_key and route_ids:
+                      valid_ids = [
+                          rid for rid in route_ids
+                          if rid is not None
+                      ]
+
+                      if valid_ids:
+                          placeholders = ",".join(
+                              "?" for _ in valid_ids
+                          )
+
+                          rows = db.execute(
+                              f'SELECT * FROM "{table}" '
+                              f'WHERE "{route_key}" IN ({placeholders}) '
+                              f'LIMIT 50',
+                              valid_ids
+                          ).fetchall()
+
+                  if not rows:
+                      rows = db.execute(
+                          f'SELECT * FROM "{table}" LIMIT 15'
+                      ).fetchall()
+
+                  print(f"Rows displayed: {len(rows)}")
+
+                  for row in rows:
+                      print(dict(row))
+
+          print("\n========== INSPECTION COMPLETE ==========")
           db.close()
           PY
 
