@@ -1,0 +1,290 @@
+
+name: Inspect Israeli Transit Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_ids:
+        description: "Service IDs to investigate, separated by commas"
+        required: false
+        default: "5,6,25,26,27,28,129,131,132,134,151,153,154,155"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: transit-data-inspection
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: Build temporary database and inspect data
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download official transport data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/source build/output
+
+          curl -fL --retry 3 --retry-delay 5 \
+            "https://gtfs.mot.gov.il/gtfsfiles/israel-public-transportation.zip" \
+            -o build/source/israel-public-transportation.zip
+
+          curl -fL --retry 3 --retry-delay 5 \
+            "https://gtfs.mot.gov.il/gtfsfiles/RouteNetworksByDate_10_Days.zip" \
+            -o build/source/RouteNetworksByDate_10_Days.zip
+
+      - name: Verify source archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m zipfile -t build/source/israel-public-transportation.zip
+          python -m zipfile -t build/source/RouteNetworksByDate_10_Days.zip
+
+      - name: Build temporary SQLite database
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python scripts/build_data.py \
+            --gtfs build/source/israel-public-transportation.zip \
+            --networks build/source/RouteNetworksByDate_10_Days.zip \
+            --output build/output/israel-transit.sqlite
+
+      - name: Validate calendar and trip services
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import sqlite3
+          from datetime import datetime, timedelta
+          from pathlib import Path
+
+          db = sqlite3.connect(
+              "build/output/israel-transit.sqlite"
+          )
+          db.row_factory = sqlite3.Row
+
+          required = {
+              "service_id",
+              "sunday", "monday", "tuesday", "wednesday",
+              "thursday", "friday", "saturday",
+              "start_date", "end_date"
+          }
+
+          actual = {
+              row["name"]
+              for row in db.execute('PRAGMA table_info("calendar")')
+          }
+
+          missing = required - actual
+          if missing:
+              raise SystemExit(
+                  "Missing calendar columns: "
+                  + ", ".join(sorted(missing))
+              )
+
+          trip_columns = {
+              row["name"]
+              for row in db.execute('PRAGMA table_info("trips")')
+          }
+
+          if "service_id" not in trip_columns:
+              raise SystemExit("trips.service_id is missing")
+
+          rows = db.execute("""
+              SELECT service_id, sunday, monday, tuesday,
+                     wednesday, thursday, friday, saturday,
+                     start_date, end_date
+              FROM calendar
+          """).fetchall()
+
+          weekday_numbers = {
+              "monday": 0, "tuesday": 1, "wednesday": 2,
+              "thursday": 3, "friday": 4, "saturday": 5,
+              "sunday": 6
+          }
+
+          weekday_columns = [
+              "monday", "tuesday", "wednesday",
+              "thursday", "friday", "saturday", "sunday"
+          ]
+
+          errors = []
+          seen = set()
+          inactive = []
+
+          for row in rows:
+              sid = row["service_id"]
+
+              if sid in seen:
+                  errors.append(f"Duplicate service_id: {sid}")
+              seen.add(sid)
+
+              try:
+                  start = datetime.strptime(
+                      str(row["start_date"]), "%Y%m%d"
+                  ).date()
+                  end = datetime.strptime(
+                      str(row["end_date"]), "%Y%m%d"
+                  ).date()
+              except (ValueError, TypeError):
+                  errors.append(f"Invalid dates for service_id {sid}")
+                  continue
+
+              if start > end:
+                  errors.append(f"start_date after end_date: {sid}")
+                  continue
+
+              active = set()
+
+              for day in weekday_columns:
+                  value = str(row[day])
+                  if value not in ("0", "1"):
+                      errors.append(
+                          f"Invalid {day} value for service_id {sid}: {value}"
+                      )
+                  elif value == "1":
+                      active.add(weekday_numbers[day])
+
+              if not active:
+                  inactive.append(sid)
+                  continue
+
+              # If the range covers at least seven days,
+              # every weekday occurs in it.
+              if (end - start).days >= 6:
+                  has_active_date = True
+              else:
+                  has_active_date = any(
+                      (start + timedelta(days=i)).weekday() in active
+                      for i in range((end - start).days + 1)
+                  )
+
+              if not has_active_date:
+                  inactive.append(sid)
+
+          missing_count = db.execute("""
+              SELECT COUNT(*)
+              FROM (
+                  SELECT DISTINCT t.service_id
+                  FROM trips t
+                  LEFT JOIN calendar c
+                    ON c.service_id = t.service_id
+                  WHERE c.service_id IS NULL
+              )
+          """).fetchone()[0]
+
+          print(f"Calendar services: {len(rows):,}")
+          print(f"Services missing from calendar: {missing_count:,}")
+          print(f"Services without an active date: {len(inactive):,}")
+
+          if inactive:
+              print("\nFirst 50 inactive service IDs:")
+              for sid in inactive[:50]:
+                  print(f"  {sid}")
+
+          if missing_count:
+              errors.append(
+                  f"{missing_count} trip service IDs missing from calendar"
+              )
+
+          if errors:
+              print("\nVALIDATION ERRORS:")
+              for error in errors:
+                  print(f"  - {error}")
+              db.close()
+              raise SystemExit(1)
+
+          print("\nCalendar validation completed.")
+          db.close()
+          PY
+
+      - name: Investigate selected services
+        shell: bash
+        env:
+          SERVICE_IDS: ${{ inputs.service_ids }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import sqlite3
+
+          raw_ids = os.environ.get("SERVICE_IDS", "")
+          service_ids = [
+              item.strip()
+              for item in raw_ids.split(",")
+              if item.strip()
+          ]
+
+          if not service_ids:
+              print("No service IDs selected.")
+              raise SystemExit(0)
+
+          db = sqlite3.connect(
+              "build/output/israel-transit.sqlite"
+          )
+
+          placeholders = ",".join("?" for _ in service_ids)
+
+          query = f"""
+              SELECT
+                  c.service_id,
+                  c.start_date,
+                  c.end_date,
+                  c.sunday,
+                  c.monday,
+                  c.tuesday,
+                  c.wednesday,
+                  c.thursday,
+                  c.friday,
+                  c.saturday,
+                  COUNT(DISTINCT t.trip_id) AS trip_count,
+                  COUNT(st.trip_id) AS stop_time_count
+              FROM calendar c
+              LEFT JOIN trips t
+                  ON t.service_id = c.service_id
+              LEFT JOIN stop_times st
+                  ON st.trip_id = t.trip_id
+              WHERE c.service_id IN ({placeholders})
+              GROUP BY c.service_id
+              ORDER BY c.service_id
+          """
+
+          print(
+              "service_id | start | end | sun mon tue wed thu fri sat "
+              "| trips | stop_times"
+          )
+
+          found = set()
+
+          for row in db.execute(query, service_ids):
+              found.add(str(row[0]))
+              print(" | ".join(str(value) for value in row))
+
+          for sid in service_ids:
+              if sid not in found:
+                  print(f"{sid} | NOT FOUND IN CALENDAR")
+
+          db.close()
+          PY
+
+      - name: Remove temporary files
+        if: always()
+        shell: bash
+        run: rm -rf build
