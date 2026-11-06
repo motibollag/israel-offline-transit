@@ -91,6 +91,7 @@ jobs:
           }
 
           missing = required - actual
+
           if missing:
               raise SystemExit(
                   "Missing calendar columns: "
@@ -132,31 +133,41 @@ jobs:
 
               if sid in seen:
                   errors.append(f"Duplicate service_id: {sid}")
+
               seen.add(sid)
 
               try:
                   start = datetime.strptime(
                       str(row["start_date"]), "%Y%m%d"
                   ).date()
+
                   end = datetime.strptime(
                       str(row["end_date"]), "%Y%m%d"
                   ).date()
+
               except (ValueError, TypeError):
-                  errors.append(f"Invalid dates for service_id {sid}")
+                  errors.append(
+                      f"Invalid dates for service_id {sid}"
+                  )
                   continue
 
               if start > end:
-                  errors.append(f"start_date after end_date: {sid}")
+                  errors.append(
+                      f"start_date after end_date: {sid}"
+                  )
                   continue
 
               active = set()
 
               for day in weekday_columns:
                   value = str(row[day])
+
                   if value not in ("0", "1"):
                       errors.append(
-                          f"Invalid {day} value for service_id {sid}: {value}"
+                          f"Invalid {day} value for "
+                          f"service_id {sid}: {value}"
                       )
+
                   elif value == "1":
                       active.add(weekday_numbers[day])
 
@@ -166,6 +177,7 @@ jobs:
 
               if (end - start).days >= 6:
                   has_active_date = True
+
               else:
                   has_active_date = any(
                       (start + timedelta(days=i)).weekday() in active
@@ -187,31 +199,296 @@ jobs:
           """).fetchone()[0]
 
           print(f"Calendar services: {len(rows):,}")
-          print(f"Services missing from calendar: {missing_count:,}")
-          print(f"Services without an active date: {len(inactive):,}")
+          print(
+              f"Services missing from calendar: {missing_count:,}"
+          )
+          print(
+              f"Services without an active date: {len(inactive):,}"
+          )
 
           if inactive:
               print("\nFirst 50 inactive service IDs:")
+
               for sid in inactive[:50]:
                   print(f"  {sid}")
 
           if missing_count:
               errors.append(
-                  f"{missing_count} trip service IDs missing from calendar"
+                  f"{missing_count} trip service IDs "
+                  "missing from calendar"
               )
 
           if errors:
               print("\nVALIDATION ERRORS:")
+
               for error in errors:
                   print(f"  - {error}")
+
               db.close()
               raise SystemExit(1)
 
           print("\nCalendar validation completed.")
+
           db.close()
           PY
 
-            - name: Inspect database structure and service 129
+      - name: Investigate selected services and trips
+        shell: bash
+        env:
+          SERVICE_IDS: ${{ inputs.service_ids }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import sqlite3
+
+          db = sqlite3.connect(
+              "build/output/israel-transit.sqlite"
+          )
+          db.row_factory = sqlite3.Row
+
+          service_ids = [
+              item.strip()
+              for item in os.environ.get(
+                  "SERVICE_IDS", ""
+              ).split(",")
+              if item.strip()
+          ]
+
+          if not service_ids:
+              print("No service IDs selected.")
+              db.close()
+              raise SystemExit(0)
+
+          def get_columns(table):
+              return {
+                  row["name"]
+                  for row in db.execute(
+                      f'PRAGMA table_info("{table}")'
+                  )
+              }
+
+          def expression(alias, available, column, fallback="NULL"):
+              if column in available:
+                  return f'{alias}."{column}"'
+
+              return fallback
+
+          tables = {
+              row["name"]
+              for row in db.execute("""
+                  SELECT name
+                  FROM sqlite_master
+                  WHERE type='table'
+              """)
+          }
+
+          for table in [
+              "calendar", "trips", "routes",
+              "agency", "stops", "stop_times"
+          ]:
+              if table not in tables:
+                  raise SystemExit(f"Missing table: {table}")
+
+          tc = get_columns("trips")
+          rc = get_columns("routes")
+          ac = get_columns("agency")
+          stc = get_columns("stop_times")
+
+          selected = ",".join("?" for _ in service_ids)
+
+          print("\n========== SELECTED SERVICE DETAILS ==========")
+
+          calendar_query = f"""
+              SELECT *
+              FROM calendar
+              WHERE service_id IN ({selected})
+              ORDER BY service_id
+          """
+
+          for row in db.execute(calendar_query, service_ids):
+              print("\nCALENDAR:")
+              print(dict(row))
+
+          print("\n========== ROUTES AND OPERATORS ==========")
+
+          trip_fields = [
+              "trip_id", "service_id", "route_id",
+              "direction_id", "trip_headsign", "shape_id"
+          ]
+
+          route_fields = [
+              "route_short_name", "route_long_name",
+              "route_type", "agency_id"
+          ]
+
+          agency_fields = [
+              "agency_name", "agency_url", "agency_id"
+          ]
+
+          select_parts = [
+              expression("t", tc, col) + f' AS "{col}"'
+              for col in trip_fields
+          ]
+
+          select_parts += [
+              expression("r", rc, col) + f' AS "route_{col}"'
+              for col in route_fields
+          ]
+
+          select_parts += [
+              expression("a", ac, col) + f' AS "{col}"'
+              for col in agency_fields
+          ]
+
+          query = f"""
+              SELECT {", ".join(select_parts)}
+              FROM trips t
+              LEFT JOIN routes r
+                ON r.route_id = t.route_id
+              LEFT JOIN agency a
+                ON a.agency_id = r.agency_id
+              WHERE t.service_id IN ({selected})
+              ORDER BY t.service_id, t.route_id, t.trip_id
+          """
+
+          trips = db.execute(query, service_ids).fetchall()
+
+          print(f"Selected trips: {len(trips):,}")
+
+          route_ids = set()
+
+          for row in trips:
+              item = dict(row)
+              route_ids.add(item.get("route_id"))
+
+              print("\nTRIP:")
+
+              for key, value in item.items():
+                  if value is not None:
+                      print(f"  {key}: {value}")
+
+          print("\n========== FIRST AND LAST STOPS ==========")
+
+          if not {
+              "trip_id", "stop_id", "stop_sequence"
+          }.issubset(stc):
+
+              print("Required stop_times columns are missing.")
+
+          else:
+              for trip in trips:
+                  trip_id = trip["trip_id"]
+
+                  first = db.execute("""
+                      SELECT st.*, s.stop_name
+                      FROM stop_times st
+                      LEFT JOIN stops s ON s.stop_id = st.stop_id
+                      WHERE st.trip_id = ?
+                      ORDER BY st.stop_sequence ASC
+                      LIMIT 1
+                  """, (trip_id,)).fetchone()
+
+                  last = db.execute("""
+                      SELECT st.*, s.stop_name
+                      FROM stop_times st
+                      LEFT JOIN stops s ON s.stop_id = st.stop_id
+                      WHERE st.trip_id = ?
+                      ORDER BY st.stop_sequence DESC
+                      LIMIT 1
+                  """, (trip_id,)).fetchone()
+
+                  print(f"\nTRIP {trip_id}")
+
+                  for label, stop in [
+                      ("FIRST", first), ("LAST", last)
+                  ]:
+                      if stop is None:
+                          print(f"  {label}: NO STOP TIMES")
+                          continue
+
+                      print(f"  {label}:")
+                      print(f"    stop_id: {stop['stop_id']}")
+                      print(f"    stop_name: {stop['stop_name']}")
+                      print(
+                          f"    stop_sequence: "
+                          f"{stop['stop_sequence']}"
+                      )
+
+                      for time_col in [
+                          "arrival_time", "departure_time"
+                      ]:
+                          if time_col in stc:
+                              print(
+                                  f"    {time_col}: "
+                                  f"{stop[time_col]}"
+                              )
+
+          print("\n========== ROUTE NETWORK TABLES ==========")
+
+          network_tables = [
+              name for name in sorted(tables)
+              if "network" in name.lower()
+              or "routenetwork" in name.lower()
+              or "cluster" in name.lower()
+          ]
+
+          if not network_tables:
+              print("No route network tables found.")
+
+          else:
+              for table in network_tables:
+                  print(f"\nTABLE: {table}")
+
+                  cols = get_columns(table)
+
+                  print("COLUMNS:", ", ".join(sorted(cols)))
+
+                  route_key = next(
+                      (c for c in [
+                          "route_id", "routeid",
+                          "route", "line_id", "lineid"
+                      ] if c in cols),
+                      None
+                  )
+
+                  rows = []
+
+                  if route_key and route_ids:
+                      valid_ids = [
+                          rid for rid in route_ids
+                          if rid is not None
+                      ]
+
+                      if valid_ids:
+                          placeholders = ",".join(
+                              "?" for _ in valid_ids
+                          )
+
+                          rows = db.execute(
+                              f'SELECT * FROM "{table}" '
+                              f'WHERE "{route_key}" IN ({placeholders}) '
+                              f'LIMIT 50',
+                              valid_ids
+                          ).fetchall()
+
+                  if not rows:
+                      rows = db.execute(
+                          f'SELECT * FROM "{table}" LIMIT 15'
+                      ).fetchall()
+
+                  print(f"Rows displayed: {len(rows)}")
+
+                  for row in rows:
+                      print(dict(row))
+
+          print("\n========== INSPECTION COMPLETE ==========")
+
+          db.close()
+          PY
+
+      - name: Detailed investigation of service 129
         shell: bash
         run: |
           set -euo pipefail
@@ -295,7 +572,9 @@ jobs:
               WHERE service_id = ?
           """, ("129",)).fetchall()
 
-          print(f"Number of calendar records: {len(calendar)}")
+          print(
+              f"Number of calendar records: {len(calendar)}"
+          )
 
           for row in calendar:
               for key, value in dict(row).items():
@@ -305,4 +584,8 @@ jobs:
 
           db.close()
           PY
+
+      - name: Remove temporary files
+        if: always()
+        shell: bash
         run: rm -rf build
