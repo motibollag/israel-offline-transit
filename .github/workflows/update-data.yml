@@ -38,7 +38,6 @@ jobs:
           curl -fL --retry 3 --retry-delay 5 \
             "https://gtfs.mot.gov.il/gtfsfiles/israel-public-transportation.zip" \
             -o build/source/israel-public-transportation.zip
-
           curl -fL --retry 3 --retry-delay 5 \
             "https://gtfs.mot.gov.il/gtfsfiles/RouteNetworksByDate_10_Days.zip" \
             -o build/source/RouteNetworksByDate_10_Days.zip
@@ -61,11 +60,24 @@ jobs:
             --networks build/source/RouteNetworksByDate_10_Days.zip \
             --output build/output/israel-transit.sqlite
 
-      - name: Validate calendar and trip services
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: motibollag/app
+          path: app-source
+
+      - name: Prepare routing data
         shell: bash
         run: |
           set -euo pipefail
 
+          python app-source/app/scripts/prepare_routing_data.py \
+            --database build/output/israel-transit.sqlite
+
+      - name: Validate calendar and trip services
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
           import sqlite3
           from datetime import datetime, timedelta
@@ -90,7 +102,6 @@ jobs:
 
           calendar_columns = columns("calendar")
           missing_columns = required_calendar_columns - calendar_columns
-
           if missing_columns:
               raise SystemExit(
                   "calendar is missing columns: "
@@ -116,7 +127,6 @@ jobs:
           print(f"Calendar services: {len(calendar_rows):,}")
 
           errors = []
-          warnings = []
           seen_ids = set()
           inactive_services = []
 
@@ -151,7 +161,6 @@ jobs:
                   continue
 
               active_days = []
-
               for column in weekday_columns:
                   value = str(row[column])
                   if value not in ("0", "1"):
@@ -268,7 +277,9 @@ jobs:
 
           required = {
               "agency", "routes", "trips", "stops",
-              "stop_times", "import_metadata"
+              "stop_times", "import_metadata",
+              "route_patterns", "route_pattern_stops",
+              "trip_patterns"
           }
 
           tables = {
@@ -365,7 +376,9 @@ jobs:
           db.close()
 
           if result != "ok":
-              raise SystemExit(f"Compressed database verification failed: {result}")
+              raise SystemExit(
+                  f"Compressed database verification failed: {result}"
+              )
 
           temporary.unlink()
 
@@ -380,7 +393,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           TAG="data-$(date -u +%Y%m%d-%H%M%S)"
 
           gh release create "$TAG" \
@@ -396,7 +408,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           TAG="${{ steps.publish.outputs.tag }}"
 
           ASSET_NAME="$(
