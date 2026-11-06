@@ -1,7 +1,9 @@
+
 name: Update Israeli Transit Data
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "30 3 * * *"
 
@@ -14,11 +16,12 @@ concurrency:
 
 jobs:
   build-and-publish:
+    name: Build and publish transit database
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
-      - name: Get project files
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -27,76 +30,166 @@ jobs:
           python-version: "3.12"
 
       - name: Download official transport data
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p build/source build/output
 
-          curl -fL --retry 3 \
+          curl -fL --retry 3 --retry-delay 5 \
             "https://gtfs.mot.gov.il/gtfsfiles/israel-public-transportation.zip" \
             -o build/source/israel-public-transportation.zip
 
-          curl -fL --retry 3 \
+          curl -fL --retry 3 --retry-delay 5 \
             "https://gtfs.mot.gov.il/gtfsfiles/RouteNetworksByDate_10_Days.zip" \
             -o build/source/RouteNetworksByDate_10_Days.zip
 
       - name: Verify downloaded ZIP files
+        shell: bash
         run: |
+          set -euo pipefail
+
           python -m zipfile -t build/source/israel-public-transportation.zip
           python -m zipfile -t build/source/RouteNetworksByDate_10_Days.zip
 
+          test -s build/source/israel-public-transportation.zip
+          test -s build/source/RouteNetworksByDate_10_Days.zip
+
       - name: Build SQLite database
+        shell: bash
         run: |
+          set -euo pipefail
+
           python scripts/build_data.py \
             --gtfs build/source/israel-public-transportation.zip \
             --networks build/source/RouteNetworksByDate_10_Days.zip \
             --output build/output/israel-transit.sqlite
 
       - name: Verify database
+        shell: bash
         run: |
+          set -euo pipefail
+
           test -s build/output/israel-transit.sqlite
-          python -c "import sqlite3; c=sqlite3.connect('build/output/israel-transit.sqlite'); print(c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
+
+          python - <<'PY'
+          import sqlite3
+
+          path = "build/output/israel-transit.sqlite"
+          connection = sqlite3.connect(path)
+
+          result = connection.execute("PRAGMA integrity_check").fetchone()[0]
+          if result != "ok":
+              raise SystemExit(f"Database integrity failed: {result}")
+
+          required = {
+              "agency",
+              "routes",
+              "trips",
+              "stops",
+              "stop_times",
+              "import_metadata",
+          }
+
+          tables = {
+              row[0]
+              for row in connection.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'"
+              )
+          }
+
+          missing = required - tables
+          if missing:
+              raise SystemExit(
+                  "Missing database tables: " + ", ".join(sorted(missing))
+              )
+
+          for table in required:
+              count = connection.execute(
+                  f'SELECT COUNT(*) FROM "{table}"'
+              ).fetchone()[0]
+              print(f"{table}: {count:,} rows")
+
+          connection.close()
+          print("Database verification successful.")
+          PY
 
       - name: Publish new data release
         id: publish
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="transit-data-$(date -u +%Y%m%d-%H%M%S)"
+          set -euo pipefail
+
+          TAG="data-$(date -u +%Y%m%d-%H%M%S)"
 
           gh release create "$TAG" \
             build/output/israel-transit.sqlite \
             --title "Transit data $TAG" \
-            --notes "Automatically generated from official Ministry of Transport data."
-
-          VERIFIED=$(gh release view "$TAG" \
-            --json assets \
-            --jq '[.assets[] | select(.name == "israel-transit.sqlite")] | length')
-
-          if [ "$VERIFIED" != "1" ]; then
-            echo "Release asset verification failed."
-            exit 1
-          fi
+            --notes "Automatically generated from official Israeli Ministry of Transport data."
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Delete older transit-data releases only
+          echo "Published release: $TAG"
+
+      - name: Verify published release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
+          TAG="${{ steps.publish.outputs.tag }}"
+
+          ASSET_NAME="$(
+            gh release view "$TAG" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+
+          if ! grep -Fxq "israel-transit.sqlite" <<< "$ASSET_NAME"; then
+            echo "Published database asset was not found."
+            exit 1
+          fi
+
+          echo "Published database verified successfully."
+
+      - name: Delete previous data releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
           NEW_TAG="${{ steps.publish.outputs.tag }}"
 
-          mapfile -t OLD_TAGS < <(
-            gh release list --limit 100 --json tagName \
-              --jq '.[].tagName' |
-            grep '^transit-data-' || true
+          if [[ ! "$NEW_TAG" =~ ^data-[0-9]{8}-[0-9]{6}$ ]]; then
+            echo "Unexpected release tag. Nothing will be deleted."
+            exit 1
+          fi
+
+          mapfile -t RELEASE_TAGS < <(
+            gh release list --limit 1000 --json tagName \
+              --jq '.[].tagName'
           )
 
-          for OLD_TAG in "${OLD_TAGS[@]}"; do
-            if [ "$OLD_TAG" != "$NEW_TAG" ]; then
-              echo "Deleting old transit-data release: $OLD_TAG"
-              gh release delete "$OLD_TAG" --yes --cleanup-tag
+          for OLD_TAG in "${RELEASE_TAGS[@]}"; do
+            if [[ "$OLD_TAG" =~ ^data-[0-9]{8}-[0-9]{6}$ ]] \
+              && [[ "$OLD_TAG" != "$NEW_TAG" ]]; then
+
+              echo "Deleting previous data release: $OLD_TAG"
+
+              gh release delete "$OLD_TAG" \
+                --yes \
+                --cleanup-tag
             fi
           done
 
-      - name: Remove temporary build files
+          echo "Old data releases cleanup completed."
+
+      - name: Remove temporary files
         if: always()
-        run: rm -rf build
+        shell: bash
+        run: |
+          rm -rf build
