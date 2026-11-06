@@ -3,7 +3,6 @@ name: Update Israeli Transit Data
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: "30 3 * * *"
 
@@ -18,7 +17,7 @@ jobs:
   build-and-publish:
     name: Build and publish transit database
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -44,16 +43,13 @@ jobs:
             "https://gtfs.mot.gov.il/gtfsfiles/RouteNetworksByDate_10_Days.zip" \
             -o build/source/RouteNetworksByDate_10_Days.zip
 
-      - name: Verify downloaded ZIP files
+      - name: Verify source archives
         shell: bash
         run: |
           set -euo pipefail
 
           python -m zipfile -t build/source/israel-public-transportation.zip
           python -m zipfile -t build/source/RouteNetworksByDate_10_Days.zip
-
-          test -s build/source/israel-public-transportation.zip
-          test -s build/source/RouteNetworksByDate_10_Days.zip
 
       - name: Build SQLite database
         shell: bash
@@ -65,53 +61,130 @@ jobs:
             --networks build/source/RouteNetworksByDate_10_Days.zip \
             --output build/output/israel-transit.sqlite
 
-      - name: Verify database
+      - name: Verify database and report table sizes
         shell: bash
         run: |
           set -euo pipefail
 
-          test -s build/output/israel-transit.sqlite
-
           python - <<'PY'
           import sqlite3
+          from pathlib import Path
 
-          path = "build/output/israel-transit.sqlite"
-          connection = sqlite3.connect(path)
+          path = Path("build/output/israel-transit.sqlite")
+          if not path.is_file() or path.stat().st_size == 0:
+              raise SystemExit("Database file is missing or empty")
 
-          result = connection.execute("PRAGMA integrity_check").fetchone()[0]
-          if result != "ok":
-              raise SystemExit(f"Database integrity failed: {result}")
+          db = sqlite3.connect(path)
+
+          integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+          if integrity != "ok":
+              raise SystemExit(f"Integrity check failed: {integrity}")
 
           required = {
-              "agency",
-              "routes",
-              "trips",
-              "stops",
-              "stop_times",
-              "import_metadata",
+              "agency", "routes", "trips", "stops",
+              "stop_times", "import_metadata"
           }
 
           tables = {
-              row[0]
-              for row in connection.execute(
+              row[0] for row in db.execute(
                   "SELECT name FROM sqlite_master WHERE type='table'"
               )
           }
 
           missing = required - tables
           if missing:
-              raise SystemExit(
-                  "Missing database tables: " + ", ".join(sorted(missing))
-              )
+              raise SystemExit("Missing tables: " + ", ".join(sorted(missing)))
 
-          for table in required:
-              count = connection.execute(
-                  f'SELECT COUNT(*) FROM "{table}"'
+          print("\nDATABASE TABLE COUNTS")
+          for table in sorted(tables):
+              if table.startswith("sqlite_"):
+                  continue
+              count = db.execute(
+                  'SELECT COUNT(*) FROM "' + table.replace('"', '""') + '"'
               ).fetchone()[0]
               print(f"{table}: {count:,} rows")
 
-          connection.close()
-          print("Database verification successful.")
+          print("\nDATABASE SIZE")
+          print(f"{path.stat().st_size:,} bytes")
+
+          print("\nTABLE SIZE REPORT")
+          try:
+              rows = db.execute("""
+                  SELECT name, SUM(pgsize) AS bytes
+                  FROM dbstat
+                  GROUP BY name
+                  ORDER BY bytes DESC
+              """).fetchall()
+
+              for name, size in rows:
+                  print(f"{name}: {size:,} bytes")
+          except sqlite3.OperationalError as error:
+              print(f"Detailed table report unavailable: {error}")
+
+          db.close()
+          print("\nDatabase verification successful.")
+          PY
+
+      - name: Compress database
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import gzip
+          import shutil
+          from pathlib import Path
+
+          source = Path("build/output/israel-transit.sqlite")
+          target = Path("build/output/israel-transit.sqlite.gz")
+
+          with source.open("rb") as input_file:
+              with target.open("wb") as raw_output:
+                  with gzip.GzipFile(
+                      filename="israel-transit.sqlite",
+                      mode="wb",
+                      fileobj=raw_output,
+                      compresslevel=6,
+                      mtime=0
+                  ) as compressed:
+                      shutil.copyfileobj(input_file, compressed)
+
+          print(f"Original:   {source.stat().st_size:,} bytes")
+          print(f"Compressed: {target.stat().st_size:,} bytes")
+          PY
+
+      - name: Verify compressed database
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import gzip
+          import sqlite3
+          from pathlib import Path
+
+          compressed = Path("build/output/israel-transit.sqlite.gz")
+          temporary = Path("build/output/verify.sqlite")
+
+          with gzip.open(compressed, "rb") as source:
+              with temporary.open("wb") as target:
+                  while True:
+                      chunk = source.read(8 * 1024 * 1024)
+                      if not chunk:
+                          break
+                      target.write(chunk)
+
+          db = sqlite3.connect(temporary)
+          result = db.execute("PRAGMA integrity_check").fetchone()[0]
+          db.close()
+
+          if result != "ok":
+              raise SystemExit(f"Compressed database verification failed: {result}")
+
+          temporary.unlink()
+
+          print("Compressed database verified successfully.")
+          print(f"Compressed file size: {compressed.stat().st_size:,} bytes")
           PY
 
       - name: Publish new data release
@@ -125,13 +198,11 @@ jobs:
           TAG="data-$(date -u +%Y%m%d-%H%M%S)"
 
           gh release create "$TAG" \
-            build/output/israel-transit.sqlite \
+            build/output/israel-transit.sqlite.gz \
             --title "Transit data $TAG" \
-            --notes "Automatically generated from official Israeli Ministry of Transport data."
+            --notes "Compressed SQLite database generated from official Ministry of Transport data."
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-          echo "Published release: $TAG"
 
       - name: Verify published release
         shell: bash
@@ -148,12 +219,12 @@ jobs:
               --jq '.assets[].name'
           )"
 
-          if ! grep -Fxq "israel-transit.sqlite" <<< "$ASSET_NAME"; then
-            echo "Published database asset was not found."
+          if ! grep -Fxq "israel-transit.sqlite.gz" <<< "$ASSET_NAME"; then
+            echo "Published compressed database was not found."
             exit 1
           fi
 
-          echo "Published database verified successfully."
+          echo "Published release verified successfully."
 
       - name: Delete previous data releases
         shell: bash
@@ -165,7 +236,7 @@ jobs:
           NEW_TAG="${{ steps.publish.outputs.tag }}"
 
           if [[ ! "$NEW_TAG" =~ ^data-[0-9]{8}-[0-9]{6}$ ]]; then
-            echo "Unexpected release tag. Nothing will be deleted."
+            echo "Unexpected tag. Refusing to delete releases."
             exit 1
           fi
 
@@ -177,19 +248,12 @@ jobs:
           for OLD_TAG in "${RELEASE_TAGS[@]}"; do
             if [[ "$OLD_TAG" =~ ^data-[0-9]{8}-[0-9]{6}$ ]] \
               && [[ "$OLD_TAG" != "$NEW_TAG" ]]; then
-
-              echo "Deleting previous data release: $OLD_TAG"
-
-              gh release delete "$OLD_TAG" \
-                --yes \
-                --cleanup-tag
+              echo "Deleting old data release: $OLD_TAG"
+              gh release delete "$OLD_TAG" --yes --cleanup-tag
             fi
           done
-
-          echo "Old data releases cleanup completed."
 
       - name: Remove temporary files
         if: always()
         shell: bash
-        run: |
-          rm -rf build
+        run: rm -rf build
