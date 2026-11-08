@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Build an optimized, lightweight offline Israeli public-transport SQLite database.
+Build an optimized, high-performance offline Israeli public-transport SQLite database.
 
-Imports only the required GTFS tables for routing and transit info:
-- agency, routes, trips, stops, stop_times, calendar, calendar_dates
-
-Omits heavy and unused tables (shapes, translations, fare rules, etc.)
-to reduce the database size from ~500MB down to ~40-60MB.
+1. Imports only active services (from yesterday to +35 days) to eliminate
+   expired historical schedules that clutter the database.
+2. Only imports trips and stop_times for active services, cutting millions
+   of dead rows and drastically speeding up queries on the mobile device.
+3. Keeps essential indexes for maximum query performance while eliminating
+   redundant duplicate indexes.
 """
 
 import argparse
@@ -16,7 +17,7 @@ import re
 import sqlite3
 import sys
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -97,28 +98,6 @@ def decode_csv_bytes(data):
     raise ValueError("Could not decode CSV file using supported encodings")
 
 
-def find_csv_files(zip_path):
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        bad_member = archive.testzip()
-        if bad_member:
-            raise ValueError(f"Damaged ZIP member: {bad_member}")
-
-        for member in archive.namelist():
-            if member.endswith("/"):
-                continue
-
-            suffix = Path(member).suffix.lower()
-            if suffix not in (".txt", ".csv"):
-                continue
-
-            yield member, archive.read(member)
-
-
-def table_name_from_member(member):
-    stem = Path(member).stem.lower()
-    return re.sub(r"[^a-z0-9_]", "_", stem)
-
-
 def parse_gtfs_time(value, table_name, column_name, row_number):
     if value == "":
         return None
@@ -152,7 +131,65 @@ def convert_value(table_name, column_name, value, row_number):
     return value if value != "" else ""
 
 
-def import_csv(connection, table_name, data):
+def collect_active_service_and_trip_ids(archive):
+    """
+    Find service_ids that are active between (today - 1 day) and (today + 35 days).
+    Then collect all trip_ids associated with these active services.
+    """
+    today = datetime.now(timezone.utc).date()
+    min_date_str = (today - timedelta(days=1)).strftime("%Y%m%d")
+    max_date_str = (today + timedelta(days=35)).strftime("%Y%m%d")
+
+    print(f"Filtering active schedules for date window: {min_date_str} to {max_date_str}")
+
+    active_service_ids = set()
+
+    # 1. Parse calendar.txt
+    if "calendar.txt" in archive.namelist():
+        text_data = decode_csv_bytes(archive.read("calendar.txt"))
+        reader = csv.DictReader(io.StringIO(text_data))
+        for row in reader:
+            s_id = row.get("service_id", "").strip()
+            start = row.get("start_date", "").strip()
+            end = row.get("end_date", "").strip()
+
+            # Keep service if it ends on or after yesterday and starts on or before +35 days
+            if s_id and end >= min_date_str and start <= max_date_str:
+                active_service_ids.add(s_id)
+
+    # 2. Parse calendar_dates.txt if present
+    if "calendar_dates.txt" in archive.namelist():
+        text_data = decode_csv_bytes(archive.read("calendar_dates.txt"))
+        reader = csv.DictReader(io.StringIO(text_data))
+        for row in reader:
+            s_id = row.get("service_id", "").strip()
+            d = row.get("date", "").strip()
+            if s_id and min_date_str <= d <= max_date_str:
+                active_service_ids.add(s_id)
+
+    print(f"Active service IDs found: {len(active_service_ids):,}")
+
+    # Fallback: if feed has unexpected format, do not filter
+    if not active_service_ids:
+        print("Warning: No active services found in window. Keeping all services.")
+        return None, None
+
+    # 3. Parse trips.txt to collect trip_ids belonging to active services
+    active_trip_ids = set()
+    if "trips.txt" in archive.namelist():
+        text_data = decode_csv_bytes(archive.read("trips.txt"))
+        reader = csv.DictReader(io.StringIO(text_data))
+        for row in reader:
+            t_id = row.get("trip_id", "").strip()
+            s_id = row.get("service_id", "").strip()
+            if t_id and s_id in active_service_ids:
+                active_trip_ids.add(t_id)
+
+    print(f"Active trip IDs found: {len(active_trip_ids):,}")
+    return active_service_ids, active_trip_ids
+
+
+def import_csv(connection, table_name, data, active_service_ids=None, active_trip_ids=None):
     text_data = decode_csv_bytes(data)
     reader = csv.reader(io.StringIO(text_data, newline=""))
 
@@ -165,6 +202,14 @@ def import_csv(connection, table_name, data):
     columns = clean_column_names(headers)
     if not columns:
         raise ValueError(f"No columns found in {table_name}")
+
+    service_id_idx = None
+    trip_id_idx = None
+    for idx, col in enumerate(columns):
+        if col.lower() == "service_id":
+            service_id_idx = idx
+        if col.lower() == "trip_id":
+            trip_id_idx = idx
 
     included_indices = []
     final_columns = []
@@ -200,6 +245,21 @@ def import_csv(connection, table_name, data):
         if len(row) < len(columns):
             row.extend([""] * (len(columns) - len(row)))
 
+        # Filter calendar table by active service_ids
+        if table_name in ("calendar", "calendar_dates") and active_service_ids is not None:
+            if service_id_idx is not None and row[service_id_idx].strip() not in active_service_ids:
+                continue
+
+        # Filter trips table by active service_ids
+        if table_name == "trips" and active_service_ids is not None:
+            if service_id_idx is not None and row[service_id_idx].strip() not in active_service_ids:
+                continue
+
+        # Filter stop_times table by active trip_ids
+        if table_name == "stop_times" and active_trip_ids is not None:
+            if trip_id_idx is not None and row[trip_id_idx].strip() not in active_trip_ids:
+                continue
+
         converted_row = []
         for idx in included_indices:
             converted_row.append(
@@ -226,6 +286,7 @@ def import_csv(connection, table_name, data):
 
 
 def create_indexes(connection):
+    # Only keep the most essential, high-performance indexes
     indexes = {
         "idx_stops_stop_id": ("stops", ["stop_id"]),
         "idx_stops_stop_name": ("stops", ["stop_name"]),
@@ -236,7 +297,6 @@ def create_indexes(connection):
         "idx_trips_route_id": ("trips", ["route_id"]),
         "idx_trips_service_id": ("trips", ["service_id"]),
         "idx_stop_times_trip_sequence": ("stop_times", ["trip_id", "stop_sequence"]),
-        "idx_stop_times_stop_id": ("stop_times", ["stop_id"]),
         "idx_calendar_dates_service": ("calendar_dates", ["service_id", "date"]),
     }
 
@@ -251,9 +311,7 @@ def create_indexes(connection):
 
         existing_columns = {
             row[1]
-            for row in connection.execute(
-                f"PRAGMA table_info({quote_identifier(table)})"
-            )
+            for row in connection.execute(f"PRAGMA table_info({quote_identifier(table)})")
         }
 
         if all(column in existing_columns for column in columns):
@@ -280,75 +338,91 @@ def main():
     if output_path.exists():
         output_path.unlink()
 
-    connection = sqlite3.connect(output_path)
+    with zipfile.ZipFile(gtfs_path, "r") as archive:
+        bad = archive.testzip()
+        if bad:
+            raise ValueError(f"Corrupted ZIP: {bad}")
 
-    try:
-        connection.execute("PRAGMA journal_mode=MEMORY")
-        connection.execute("PRAGMA synchronous=OFF")
-        connection.execute("PRAGMA page_size=4096")
+        active_service_ids, active_trip_ids = collect_active_service_and_trip_ids(archive)
 
-        connection.execute("""
-            CREATE TABLE import_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+        connection = sqlite3.connect(output_path)
+
+        try:
+            connection.execute("PRAGMA journal_mode=MEMORY")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA page_size=4096")
+
+            connection.execute("""
+                CREATE TABLE import_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+
+            imported_gtfs = set()
+
+            for member in archive.namelist():
+                if member.endswith("/"):
+                    continue
+                suffix = Path(member).suffix.lower()
+                if suffix not in (".txt", ".csv"):
+                    continue
+
+                table_name = Path(member).stem.lower()
+                table_name = re.sub(r"[^a-z0-9_]", "_", table_name)
+
+                if table_name not in ALLOWED_GTFS_TABLES:
+                    continue
+
+                data = archive.read(member)
+                import_csv(
+                    connection=connection,
+                    table_name=table_name,
+                    data=data,
+                    active_service_ids=active_service_ids,
+                    active_trip_ids=active_trip_ids
+                )
+                imported_gtfs.add(table_name)
+
+            missing = REQUIRED_GTFS_TABLES - imported_gtfs
+            if missing:
+                raise ValueError("Missing required GTFS tables: " + ", ".join(sorted(missing)))
+
+            metadata = {
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "gtfs_source": gtfs_path.name,
+                "gtfs_tables": ",".join(sorted(imported_gtfs)),
+                "format_version": "4",
+                "optimized_active_dates": "true",
+            }
+
+            connection.executemany(
+                "INSERT INTO import_metadata (key, value) VALUES (?, ?)",
+                metadata.items(),
             )
-        """)
 
-        imported_gtfs = set()
-        print("Importing essential GTFS tables...")
+            print("Creating core indexes...")
+            create_indexes(connection)
+            connection.commit()
 
-        for member, data in find_csv_files(gtfs_path):
-            table_name = table_name_from_member(member)
+            print("Compacting database (VACUUM)...")
+            connection.execute("VACUUM")
 
-            if table_name not in ALLOWED_GTFS_TABLES:
-                print(f"Skipping unnecessary table: {table_name}")
-                continue
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise RuntimeError(f"SQLite integrity check failed: {integrity}")
 
-            if table_name in imported_gtfs:
-                raise ValueError(f"Duplicate GTFS table name: {table_name}")
+            print("SQLite integrity check: OK")
+            print(f"Database created: {output_path}")
 
-            import_csv(connection, table_name, data)
-            imported_gtfs.add(table_name)
+            db_size = output_path.stat().st_size
+            print(f"Database size: {db_size} bytes")
 
-        missing = REQUIRED_GTFS_TABLES - imported_gtfs
-        if missing:
-            raise ValueError("Missing required GTFS tables: " + ", ".join(sorted(missing)))
-
-        metadata = {
-            "created_utc": datetime.now(timezone.utc).isoformat(),
-            "gtfs_source": gtfs_path.name,
-            "gtfs_tables": ",".join(sorted(imported_gtfs)),
-            "format_version": "3",
-            "optimized": "true",
-        }
-
-        connection.executemany(
-            "INSERT INTO import_metadata (key, value) VALUES (?, ?)",
-            metadata.items(),
-        )
-
-        print("Creating indexes...")
-        create_indexes(connection)
-        connection.commit()
-
-        print("Compacting database (VACUUM)...")
-        connection.execute("VACUUM")
-
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise RuntimeError(f"SQLite integrity check failed: {integrity}")
-
-        print("SQLite integrity check: OK")
-        print(f"Database created: {output_path}")
-
-        db_size = output_path.stat().st_size
-        print(f"Database size: {db_size} bytes")
-
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":
