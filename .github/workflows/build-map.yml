@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Create Tilemaker config JSON with mandatory metadata fields
+          # Create Tilemaker config JSON
           cat << 'EOF' > build/map_config.json
           {
             "layers": {
@@ -62,7 +62,7 @@ jobs:
           }
           EOF
 
-          # Create Tilemaker Lua script for Israel roads and Hebrew/English street labels
+          # Create Tilemaker Lua script
           cat << 'EOF' > build/map_process.lua
           node_keys = { "name", "name:he", "name:en" }
 
@@ -149,7 +149,6 @@ jobs:
             exit 1
           fi
 
-          # Verify PMTiles v3 magic header
           HEADER=$(head -c 7 "$MAP")
           if [ "$HEADER" != "PMTiles" ]; then
             echo "Error: File does not have PMTiles header."
@@ -158,43 +157,26 @@ jobs:
 
           echo "Map validation passed successfully."
 
-      - name: Publish map release
-        id: publish_map
+      - name: Publish dedicated offline-map release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="map-$(date -u +%Y%m%d-%H%M%S)"
+          TAG="offline-map"
 
-          gh release create "$TAG" \
-            build/israel-basemap.pmtiles \
-            --title "Offline Map $TAG" \
-            --notes "Offline vector basemap (PMTiles v3) covering roads, streets and walking paths for Israel."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing $TAG release..."
+            gh release upload "$TAG" build/israel-basemap.pmtiles --clobber
+          else
+            echo "Creating new dedicated $TAG release..."
+            gh release create "$TAG" \
+              build/israel-basemap.pmtiles \
+              --title "מפה לא מקוונת (PMTiles)" \
+              --notes "קובץ מפה וקטורית עדכני לישראל בפורמט PMTiles v3 (עבור רחובות, שבילים וכבישים)."
+          fi
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Delete previous map releases
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          NEW_TAG="${{ steps.publish_map.outputs.tag }}"
-
-          mapfile -t MAP_TAGS < <(
-            gh release list --limit 1000 --json tagName \
-              --jq '.[].tagName'
-          )
-
-          for OLD_TAG in "${MAP_TAGS[@]}"; do
-            if [[ "$OLD_TAG" =~ ^map-[0-9]{8}-[0-9]{6}$ ]] \
-              && [[ "$OLD_TAG" != "$NEW_TAG" ]]; then
-              echo "Deleting old map release: $OLD_TAG"
-              gh release delete "$OLD_TAG" --yes --cleanup-tag
-            fi
-          done
+          echo "Map release published under tag: $TAG"
 
       - name: Clean up temporary files
         if: always()
