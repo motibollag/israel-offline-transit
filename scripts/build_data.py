@@ -20,7 +20,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-# Tables strictly required by the Android application
 ALLOWED_GTFS_TABLES = {
     "agency",
     "routes",
@@ -40,7 +39,6 @@ REQUIRED_GTFS_TABLES = {
     "calendar",
 }
 
-# Only include relevant columns for stop_times to save tens of megabytes
 STOP_TIMES_COLUMNS = {
     "trip_id",
     "arrival_time",
@@ -168,7 +166,6 @@ def import_csv(connection, table_name, data):
     if not columns:
         raise ValueError(f"No columns found in {table_name}")
 
-    # Optimize stop_times by including only essential routing columns
     included_indices = []
     final_columns = []
 
@@ -303,7 +300,6 @@ def main():
         for member, data in find_csv_files(gtfs_path):
             table_name = table_name_from_member(member)
 
-            # Skip heavy tables not needed by the mobile app (shapes, translations, etc.)
             if table_name not in ALLOWED_GTFS_TABLES:
                 print(f"Skipping unnecessary table: {table_name}")
                 continue
@@ -344,4 +340,20 @@ def main():
 
         print("SQLite integrity check: OK")
         print(f"Database created: {output_path}")
-        print(f"Database size: {output_path.stat().st_size
+
+        db_size = output_path.stat().st_size
+        print(f"Database size: {db_size} bytes")
+
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"BUILD FAILED: {error}", file=sys.stderr)
+        sys.exit(1)
