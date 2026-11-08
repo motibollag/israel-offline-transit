@@ -1,10 +1,9 @@
-
 name: Update Israeli Transit Data
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 3 * * *"
+    - cron: "0 3 1 * *"
 
 permissions:
   contents: write
@@ -38,26 +37,26 @@ jobs:
           curl -fL --retry 3 --retry-delay 5 \
             "https://gtfs.mot.gov.il/gtfsfiles/israel-public-transportation.zip" \
             -o build/source/israel-public-transportation.zip
-          curl -fL --retry 3 --retry-delay 5 \
-            "https://gtfs.mot.gov.il/gtfsfiles/RouteNetworksByDate_10_Days.zip" \
-            -o build/source/RouteNetworksByDate_10_Days.zip
 
-      - name: Verify source archives
+      - name: Verify source archive
         shell: bash
         run: |
           set -euo pipefail
 
           python -m zipfile -t build/source/israel-public-transportation.zip
-          python -m zipfile -t build/source/RouteNetworksByDate_10_Days.zip
 
       - name: Build SQLite database
         shell: bash
         run: |
           set -euo pipefail
 
-          python scripts/build_data.py \
+          SCRIPT="build_data.py"
+          if [ -f "scripts/build_data.py" ]; then
+            SCRIPT="scripts/build_data.py"
+          fi
+
+          python "$SCRIPT" \
             --gtfs build/source/israel-public-transportation.zip \
-            --networks build/source/RouteNetworksByDate_10_Days.zip \
             --output build/output/israel-transit.sqlite
 
       - name: Checkout app repository
@@ -73,6 +72,22 @@ jobs:
 
           python app-source/app/scripts/prepare_routing_data.py \
             --database build/output/israel-transit.sqlite
+
+      - name: Final database vacuum and optimization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+
+          path = Path("build/output/israel-transit.sqlite")
+          conn = sqlite3.connect(path)
+          print("Packing and vacuuming database...")
+          conn.execute("VACUUM")
+          conn.close()
+          print("VACUUM completed successfully.")
+          PY
 
       - name: Validate calendar and trip services
         shell: bash
@@ -301,28 +316,12 @@ jobs:
               ).fetchone()[0]
               print(f"{table}: {count:,} rows")
 
-          print("\nDATABASE SIZE")
+          print("\nOPTIMIZED DATABASE SIZE")
           print(f"{path.stat().st_size:,} bytes")
-
-          print("\nTABLE SIZE REPORT")
-          try:
-              rows = db.execute("""
-                  SELECT name, SUM(pgsize) AS bytes
-                  FROM dbstat
-                  GROUP BY name
-                  ORDER BY bytes DESC
-              """).fetchall()
-
-              for name, size in rows:
-                  print(f"{name}: {size:,} bytes")
-          except sqlite3.OperationalError as error:
-              print(f"Detailed table report unavailable: {error}")
-
           db.close()
-          print("\nDatabase verification successful.")
           PY
 
-      - name: Compress database
+      - name: Compress database (level 9)
         shell: bash
         run: |
           set -euo pipefail
@@ -341,13 +340,13 @@ jobs:
                       filename="israel-transit.sqlite",
                       mode="wb",
                       fileobj=raw_output,
-                      compresslevel=6,
+                      compresslevel=9,
                       mtime=0
                   ) as compressed:
                       shutil.copyfileobj(input_file, compressed)
 
-          print(f"Original:   {source.stat().st_size:,} bytes")
-          print(f"Compressed: {target.stat().st_size:,} bytes")
+          print(f"Original size:   {source.stat().st_size:,} bytes")
+          print(f"Compressed size: {target.stat().st_size:,} bytes")
           PY
 
       - name: Verify compressed database
@@ -381,9 +380,8 @@ jobs:
               )
 
           temporary.unlink()
-
           print("Compressed database verified successfully.")
-          print(f"Compressed file size: {compressed.stat().st_size:,} bytes")
+          print(f"Final release file size: {compressed.stat().st_size:,} bytes")
           PY
 
       - name: Publish new data release
@@ -398,7 +396,7 @@ jobs:
           gh release create "$TAG" \
             build/output/israel-transit.sqlite.gz \
             --title "Transit data $TAG" \
-            --notes "Compressed SQLite database generated from official Ministry of Transport data."
+            --notes "Optimized compact SQLite database generated from official Ministry of Transport GTFS data."
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
