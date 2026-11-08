@@ -384,69 +384,26 @@ jobs:
           print(f"Final release file size: {compressed.stat().st_size:,} bytes")
           PY
 
-      - name: Publish new data release
-        id: publish
+      - name: Publish dedicated transit-data release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="data-$(date -u +%Y%m%d-%H%M%S)"
+          TAG="transit-data"
 
-          gh release create "$TAG" \
-            build/output/israel-transit.sqlite.gz \
-            --title "Transit data $TAG" \
-            --notes "Optimized compact SQLite database generated from official Ministry of Transport GTFS data."
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Verify published release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.publish.outputs.tag }}"
-
-          ASSET_NAME="$(
-            gh release view "$TAG" \
-              --json assets \
-              --jq '.assets[].name'
-          )"
-
-          if ! grep -Fxq "israel-transit.sqlite.gz" <<< "$ASSET_NAME"; then
-            echo "Published compressed database was not found."
-            exit 1
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing $TAG release..."
+            gh release upload "$TAG" build/output/israel-transit.sqlite.gz --clobber
+          else
+            echo "Creating new dedicated $TAG release..."
+            gh release create "$TAG" \
+              build/output/israel-transit.sqlite.gz \
+              --title "מאגר נתוני תחבורה (GTFS)" \
+              --notes "מאגר נתוני תחבורה ציבורית מעודכן בפורמט SQLite דחוס."
           fi
 
-          echo "Published release verified successfully."
-
-      - name: Delete previous data releases
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          NEW_TAG="${{ steps.publish.outputs.tag }}"
-
-          if [[ ! "$NEW_TAG" =~ ^data-[0-9]{8}-[0-9]{6}$ ]]; then
-            echo "Unexpected tag. Refusing to delete releases."
-            exit 1
-          fi
-
-          mapfile -t RELEASE_TAGS < <(
-            gh release list --limit 1000 --json tagName \
-              --jq '.[].tagName'
-          )
-
-          for OLD_TAG in "${RELEASE_TAGS[@]}"; do
-            if [[ "$OLD_TAG" =~ ^data-[0-9]{8}-[0-9]{6}$ ]] \
-              && [[ "$OLD_TAG" != "$NEW_TAG" ]]; then
-              echo "Deleting old data release: $OLD_TAG"
-              gh release delete "$OLD_TAG" --yes --cleanup-tag
-            fi
-          done
+          echo "Transit data published under tag: $TAG"
 
       - name: Remove temporary files
         if: always()
