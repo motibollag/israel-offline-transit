@@ -22,7 +22,7 @@ jobs:
 
       - name: Create working directory
         shell: bash
-        run: mkdir -p build
+        run: mkdir -p build/store
 
       - name: Download latest OpenStreetMap data for Israel
         shell: bash
@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Create Tilemaker config JSON
+          # Create Tilemaker config JSON with mandatory metadata fields
           cat << 'EOF' > build/map_config.json
           {
             "layers": {
@@ -50,6 +50,9 @@ jobs:
               }
             },
             "settings": {
+              "name": "Israel Offline Basemap",
+              "version": "1.0",
+              "description": "Offline vector roads basemap for Israel",
               "minzoom": 6,
               "maxzoom": 14,
               "basezoom": 14,
@@ -124,7 +127,8 @@ jobs:
             /data/israel.osm.pbf \
             --output=/data/israel-basemap.pmtiles \
             --config=/data/map_config.json \
-            --process=/data/map_process.lua
+            --process=/data/map_process.lua \
+            --store=/data/store
 
       - name: Verify generated map file
         shell: bash
