@@ -2,12 +2,10 @@
 """
 Build an optimized, high-performance offline Israeli public-transport SQLite database.
 
-1. Imports only active services (from yesterday to +35 days) to eliminate
-   expired historical schedules that clutter the database.
-2. Only imports trips and stop_times for active services, cutting millions
-   of dead rows and drastically speeding up queries on the mobile device.
-3. Keeps essential indexes for maximum query performance while eliminating
-   redundant duplicate indexes.
+1. Compact ID Encoding: Maps long text trip_ids (25+ characters) to compact
+   sequential integers (1, 2, 3...), slashing table and index sizes by hundreds of MBs.
+2. Filter active schedules only (from yesterday to +35 days), eliminating millions of dead rows.
+3. Clustered primary keys on stop_times (trip_id, stop_sequence) for instant query speed.
 """
 
 import argparse
@@ -49,9 +47,11 @@ STOP_TIMES_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    ("stop_times", "trip_id"),
     ("stop_times", "stop_sequence"),
     ("stop_times", "arrival_time"),
     ("stop_times", "departure_time"),
+    ("trips", "trip_id"),
 }
 
 TIME_COLUMNS = {
@@ -99,10 +99,10 @@ def decode_csv_bytes(data):
 
 
 def parse_gtfs_time(value, table_name, column_name, row_number):
-    if value == "":
+    if value == "" or value is None:
         return None
 
-    match = re.fullmatch(r"([0-9]{1,3}):([0-5][0-9]):([0-5][0-9])", value.strip())
+    match = re.fullmatch(r"([0-9]{1,3}):([0-5][0-9]):([0-5][0-9])", str(value).strip())
     if not match:
         raise ValueError(f"Invalid GTFS time in {table_name}.{column_name}, row {row_number}: {value!r}")
 
@@ -113,10 +113,13 @@ def parse_gtfs_time(value, table_name, column_name, row_number):
 
 
 def parse_nonnegative_integer(value, table_name, column_name, row_number):
-    if value == "":
+    if value == "" or value is None:
         return None
 
-    if not re.fullmatch(r"[0-9]+", value.strip()):
+    if isinstance(value, int):
+        return value
+
+    if not re.fullmatch(r"[0-9]+", str(value).strip()):
         raise ValueError(f"Invalid integer in {table_name}.{column_name}, row {row_number}: {value!r}")
 
     return int(value)
@@ -128,38 +131,43 @@ def convert_value(table_name, column_name, value, row_number):
         return parse_gtfs_time(value, table_name, column_name, row_number)
     if key in INTEGER_COLUMNS:
         return parse_nonnegative_integer(value, table_name, column_name, row_number)
-    return value if value != "" else ""
+    return value if (value != "" and value is not None) else ""
 
 
-def collect_active_service_and_trip_ids(archive):
+def find_archive_member(archive, target_name):
+    target = target_name.lower()
+    for name in archive.namelist():
+        if Path(name).name.lower() == target:
+            return name
+    return None
+
+
+def collect_active_services_and_map_trips(archive):
     """
-    Find service_ids that are active between (today - 1 day) and (today + 35 days).
-    Then collect all trip_ids associated with these active services.
+    1. Filter active calendar service_ids.
+    2. Map long trip_id strings to compact integer codes (1, 2, 3...).
     """
     today = datetime.now(timezone.utc).date()
     min_date_str = (today - timedelta(days=1)).strftime("%Y%m%d")
     max_date_str = (today + timedelta(days=35)).strftime("%Y%m%d")
 
-    print(f"Filtering active schedules for date window: {min_date_str} to {max_date_str}")
-
+    print(f"Date window for active schedules: {min_date_str} to {max_date_str}")
     active_service_ids = set()
 
-    # 1. Parse calendar.txt
-    if "calendar.txt" in archive.namelist():
-        text_data = decode_csv_bytes(archive.read("calendar.txt"))
+    calendar_member = find_archive_member(archive, "calendar.txt")
+    if calendar_member:
+        text_data = decode_csv_bytes(archive.read(calendar_member))
         reader = csv.DictReader(io.StringIO(text_data))
         for row in reader:
             s_id = row.get("service_id", "").strip()
             start = row.get("start_date", "").strip()
             end = row.get("end_date", "").strip()
-
-            # Keep service if it ends on or after yesterday and starts on or before +35 days
             if s_id and end >= min_date_str and start <= max_date_str:
                 active_service_ids.add(s_id)
 
-    # 2. Parse calendar_dates.txt if present
-    if "calendar_dates.txt" in archive.namelist():
-        text_data = decode_csv_bytes(archive.read("calendar_dates.txt"))
+    dates_member = find_archive_member(archive, "calendar_dates.txt")
+    if dates_member:
+        text_data = decode_csv_bytes(archive.read(dates_member))
         reader = csv.DictReader(io.StringIO(text_data))
         for row in reader:
             s_id = row.get("service_id", "").strip()
@@ -167,29 +175,35 @@ def collect_active_service_and_trip_ids(archive):
             if s_id and min_date_str <= d <= max_date_str:
                 active_service_ids.add(s_id)
 
-    print(f"Active service IDs found: {len(active_service_ids):,}")
+    print(f"Active service IDs identified: {len(active_service_ids):,}")
+    filter_by_service = len(active_service_ids) > 0
 
-    # Fallback: if feed has unexpected format, do not filter
-    if not active_service_ids:
-        print("Warning: No active services found in window. Keeping all services.")
-        return None, None
+    trip_id_to_int = {}
+    trips_member = find_archive_member(archive, "trips.txt")
 
-    # 3. Parse trips.txt to collect trip_ids belonging to active services
-    active_trip_ids = set()
-    if "trips.txt" in archive.namelist():
-        text_data = decode_csv_bytes(archive.read("trips.txt"))
+    if trips_member:
+        text_data = decode_csv_bytes(archive.read(trips_member))
         reader = csv.DictReader(io.StringIO(text_data))
+        next_int_id = 1
         for row in reader:
             t_id = row.get("trip_id", "").strip()
             s_id = row.get("service_id", "").strip()
-            if t_id and s_id in active_service_ids:
-                active_trip_ids.add(t_id)
+            if not t_id:
+                continue
 
-    print(f"Active trip IDs found: {len(active_trip_ids):,}")
-    return active_service_ids, active_trip_ids
+            # Keep only active trips if services were filtered
+            if filter_by_service and s_id not in active_service_ids:
+                continue
+
+            if t_id not in trip_id_to_int:
+                trip_id_to_int[t_id] = next_int_id
+                next_int_id += 1
+
+    print(f"Active trips mapped to compact integer IDs: {len(trip_id_to_int):,}")
+    return active_service_ids if filter_by_service else None, trip_id_to_int
 
 
-def import_csv(connection, table_name, data, active_service_ids=None, active_trip_ids=None):
+def import_csv(connection, table_name, data, active_service_ids, trip_id_to_int):
     text_data = decode_csv_bytes(data)
     reader = csv.reader(io.StringIO(text_data, newline=""))
 
@@ -230,7 +244,13 @@ def import_csv(connection, table_name, data, active_service_ids=None, active_tri
         definitions.append(f"{quote_identifier(column)} {column_type}")
 
     connection.execute(f"DROP TABLE IF EXISTS {quoted_table}")
-    connection.execute(f"CREATE TABLE {quoted_table} ({', '.join(definitions)})")
+
+    # Clustered primary key on stop_times eliminates the need for separate index
+    if table_name == "stop_times":
+        definitions.append("PRIMARY KEY (\"trip_id\", \"stop_sequence\")")
+        connection.execute(f"CREATE TABLE {quoted_table} ({', '.join(definitions)}) WITHOUT ROWID")
+    else:
+        connection.execute(f"CREATE TABLE {quoted_table} ({', '.join(definitions)})")
 
     placeholders = ", ".join("?" for _ in final_columns)
     insert_sql = f"INSERT INTO {quoted_table} ({quoted_columns}) VALUES ({placeholders})"
@@ -245,20 +265,17 @@ def import_csv(connection, table_name, data, active_service_ids=None, active_tri
         if len(row) < len(columns):
             row.extend([""] * (len(columns) - len(row)))
 
-        # Filter calendar table by active service_ids
         if table_name in ("calendar", "calendar_dates") and active_service_ids is not None:
             if service_id_idx is not None and row[service_id_idx].strip() not in active_service_ids:
                 continue
 
-        # Filter trips table by active service_ids
-        if table_name == "trips" and active_service_ids is not None:
-            if service_id_idx is not None and row[service_id_idx].strip() not in active_service_ids:
-                continue
-
-        # Filter stop_times table by active trip_ids
-        if table_name == "stop_times" and active_trip_ids is not None:
-            if trip_id_idx is not None and row[trip_id_idx].strip() not in active_trip_ids:
-                continue
+        # In trips and stop_times, replace string trip_id with compact integer ID
+        if table_name in ("trips", "stop_times") and trip_id_idx is not None:
+            raw_trip_id = row[trip_id_idx].strip()
+            int_id = trip_id_to_int.get(raw_trip_id)
+            if int_id is None:
+                continue  # Skip inactive trip
+            row[trip_id_idx] = int_id
 
         converted_row = []
         for idx in included_indices:
@@ -274,7 +291,7 @@ def import_csv(connection, table_name, data, active_service_ids=None, active_tri
         batch.append(converted_row)
         row_count += 1
 
-        if len(batch) >= 10000:
+        if len(batch) >= 15000:
             connection.executemany(insert_sql, batch)
             batch.clear()
 
@@ -286,7 +303,6 @@ def import_csv(connection, table_name, data, active_service_ids=None, active_tri
 
 
 def create_indexes(connection):
-    # Only keep the most essential, high-performance indexes
     indexes = {
         "idx_stops_stop_id": ("stops", ["stop_id"]),
         "idx_stops_stop_name": ("stops", ["stop_name"]),
@@ -296,7 +312,6 @@ def create_indexes(connection):
         "idx_trips_trip_id": ("trips", ["trip_id"]),
         "idx_trips_route_id": ("trips", ["route_id"]),
         "idx_trips_service_id": ("trips", ["service_id"]),
-        "idx_stop_times_trip_sequence": ("stop_times", ["trip_id", "stop_sequence"]),
         "idx_calendar_dates_service": ("calendar_dates", ["service_id", "date"]),
     }
 
@@ -343,7 +358,7 @@ def main():
         if bad:
             raise ValueError(f"Corrupted ZIP: {bad}")
 
-        active_service_ids, active_trip_ids = collect_active_service_and_trip_ids(archive)
+        active_service_ids, trip_id_to_int = collect_active_services_and_map_trips(archive)
 
         connection = sqlite3.connect(output_path)
 
@@ -380,7 +395,7 @@ def main():
                     table_name=table_name,
                     data=data,
                     active_service_ids=active_service_ids,
-                    active_trip_ids=active_trip_ids
+                    trip_id_to_int=trip_id_to_int
                 )
                 imported_gtfs.add(table_name)
 
@@ -392,8 +407,8 @@ def main():
                 "created_utc": datetime.now(timezone.utc).isoformat(),
                 "gtfs_source": gtfs_path.name,
                 "gtfs_tables": ",".join(sorted(imported_gtfs)),
-                "format_version": "4",
-                "optimized_active_dates": "true",
+                "format_version": "5",
+                "compact_trip_ids": "true",
             }
 
             connection.executemany(
