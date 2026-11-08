@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Build an optimized, high-performance offline Israeli public-transport SQLite database.
+Build an optimized, fast offline Israeli public-transport SQLite database.
 
-1. Compact ID Encoding: Maps long text trip_ids (25+ characters) to compact
-   sequential integers (1, 2, 3...), slashing table and index sizes by hundreds of MBs.
-2. Filter active schedules only (from yesterday to +35 days), eliminating millions of dead rows.
-3. Clustered primary keys on stop_times (trip_id, stop_sequence) for instant query speed.
+1. Filter active schedules only (from yesterday to +35 days), eliminating millions of dead rows.
+2. Imports only required GTFS tables (omits shapes, translations, fare rules).
+3. Standard high-performance SQLite storage without slow B-tree thrashing.
 """
 
 import argparse
@@ -47,11 +46,9 @@ STOP_TIMES_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
-    ("stop_times", "trip_id"),
     ("stop_times", "stop_sequence"),
     ("stop_times", "arrival_time"),
     ("stop_times", "departure_time"),
-    ("trips", "trip_id"),
 }
 
 TIME_COLUMNS = {
@@ -142,11 +139,7 @@ def find_archive_member(archive, target_name):
     return None
 
 
-def collect_active_services_and_map_trips(archive):
-    """
-    1. Filter active calendar service_ids.
-    2. Map long trip_id strings to compact integer codes (1, 2, 3...).
-    """
+def collect_active_services_and_trips(archive):
     today = datetime.now(timezone.utc).date()
     min_date_str = (today - timedelta(days=1)).strftime("%Y%m%d")
     max_date_str = (today + timedelta(days=35)).strftime("%Y%m%d")
@@ -178,32 +171,26 @@ def collect_active_services_and_map_trips(archive):
     print(f"Active service IDs identified: {len(active_service_ids):,}")
     filter_by_service = len(active_service_ids) > 0
 
-    trip_id_to_int = {}
+    active_trip_ids = set()
     trips_member = find_archive_member(archive, "trips.txt")
 
     if trips_member:
         text_data = decode_csv_bytes(archive.read(trips_member))
         reader = csv.DictReader(io.StringIO(text_data))
-        next_int_id = 1
         for row in reader:
             t_id = row.get("trip_id", "").strip()
             s_id = row.get("service_id", "").strip()
             if not t_id:
                 continue
 
-            # Keep only active trips if services were filtered
-            if filter_by_service and s_id not in active_service_ids:
-                continue
+            if not filter_by_service or s_id in active_service_ids:
+                active_trip_ids.add(t_id)
 
-            if t_id not in trip_id_to_int:
-                trip_id_to_int[t_id] = next_int_id
-                next_int_id += 1
-
-    print(f"Active trips mapped to compact integer IDs: {len(trip_id_to_int):,}")
-    return active_service_ids if filter_by_service else None, trip_id_to_int
+    print(f"Active trip IDs identified: {len(active_trip_ids):,}")
+    return active_service_ids if filter_by_service else None, active_trip_ids if filter_by_service else None
 
 
-def import_csv(connection, table_name, data, active_service_ids, trip_id_to_int):
+def import_csv(connection, table_name, data, active_service_ids, active_trip_ids):
     text_data = decode_csv_bytes(data)
     reader = csv.reader(io.StringIO(text_data, newline=""))
 
@@ -244,13 +231,7 @@ def import_csv(connection, table_name, data, active_service_ids, trip_id_to_int)
         definitions.append(f"{quote_identifier(column)} {column_type}")
 
     connection.execute(f"DROP TABLE IF EXISTS {quoted_table}")
-
-    # Clustered primary key on stop_times eliminates the need for separate index
-    if table_name == "stop_times":
-        definitions.append("PRIMARY KEY (\"trip_id\", \"stop_sequence\")")
-        connection.execute(f"CREATE TABLE {quoted_table} ({', '.join(definitions)}) WITHOUT ROWID")
-    else:
-        connection.execute(f"CREATE TABLE {quoted_table} ({', '.join(definitions)})")
+    connection.execute(f"CREATE TABLE {quoted_table} ({', '.join(definitions)})")
 
     placeholders = ", ".join("?" for _ in final_columns)
     insert_sql = f"INSERT INTO {quoted_table} ({quoted_columns}) VALUES ({placeholders})"
@@ -269,13 +250,13 @@ def import_csv(connection, table_name, data, active_service_ids, trip_id_to_int)
             if service_id_idx is not None and row[service_id_idx].strip() not in active_service_ids:
                 continue
 
-        # In trips and stop_times, replace string trip_id with compact integer ID
-        if table_name in ("trips", "stop_times") and trip_id_idx is not None:
-            raw_trip_id = row[trip_id_idx].strip()
-            int_id = trip_id_to_int.get(raw_trip_id)
-            if int_id is None:
-                continue  # Skip inactive trip
-            row[trip_id_idx] = int_id
+        if table_name == "trips" and active_service_ids is not None:
+            if service_id_idx is not None and row[service_id_idx].strip() not in active_service_ids:
+                continue
+
+        if table_name == "stop_times" and active_trip_ids is not None:
+            if trip_id_idx is not None and row[trip_id_idx].strip() not in active_trip_ids:
+                continue
 
         converted_row = []
         for idx in included_indices:
@@ -312,6 +293,7 @@ def create_indexes(connection):
         "idx_trips_trip_id": ("trips", ["trip_id"]),
         "idx_trips_route_id": ("trips", ["route_id"]),
         "idx_trips_service_id": ("trips", ["service_id"]),
+        "idx_stop_times_trip_sequence": ("stop_times", ["trip_id", "stop_sequence"]),
         "idx_calendar_dates_service": ("calendar_dates", ["service_id", "date"]),
     }
 
@@ -358,7 +340,7 @@ def main():
         if bad:
             raise ValueError(f"Corrupted ZIP: {bad}")
 
-        active_service_ids, trip_id_to_int = collect_active_services_and_map_trips(archive)
+        active_service_ids, active_trip_ids = collect_active_services_and_trips(archive)
 
         connection = sqlite3.connect(output_path)
 
@@ -395,7 +377,7 @@ def main():
                     table_name=table_name,
                     data=data,
                     active_service_ids=active_service_ids,
-                    trip_id_to_int=trip_id_to_int
+                    active_trip_ids=active_trip_ids
                 )
                 imported_gtfs.add(table_name)
 
@@ -408,7 +390,7 @@ def main():
                 "gtfs_source": gtfs_path.name,
                 "gtfs_tables": ",".join(sorted(imported_gtfs)),
                 "format_version": "5",
-                "compact_trip_ids": "true",
+                "fast_storage": "true",
             }
 
             connection.executemany(
