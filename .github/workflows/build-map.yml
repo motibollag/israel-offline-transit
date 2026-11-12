@@ -339,7 +339,7 @@ jobs:
               <dependency>
                 <groupId>org.slf4j</groupId>
                 <artifactId>slf4j-simple</artifactId>
-                <version>2.0.12</version>
+                <version>1.7.36</version>
               </dependency>
             </dependencies>
             <build>
@@ -358,18 +358,25 @@ jobs:
           import com.graphhopper.GraphHopper;
           import com.graphhopper.config.CHProfile;
           import com.graphhopper.config.Profile;
+          import com.graphhopper.util.CustomModel;
 
           public class BuildGraph {
               public static void main(String[] args) {
                   String osmFile = args[0];
                   String graphDir = args[1];
 
+                  CustomModel footModel = new CustomModel();
+                  footModel.setDistanceInfluence(70.0);
+
+                  Profile footProfile = new Profile("foot");
+                  footProfile.setVehicle("foot");
+                  footProfile.setWeighting("custom");
+                  footProfile.setCustomModel(footModel);
+
                   GraphHopper hopper = new GraphHopper();
                   hopper.setOSMFile(osmFile);
                   hopper.setGraphHopperLocation(graphDir);
-                  hopper.setProfiles(
-                      new Profile("foot").setVehicle("foot").setWeighting("fastest")
-                  );
+                  hopper.setProfiles(footProfile);
                   hopper.getCHPreparationHandler().setCHProfiles(
                       new CHProfile("foot")
                   );
