@@ -21,11 +21,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-          cache: maven
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -343,6 +342,15 @@ jobs:
                 <version>2.0.12</version>
               </dependency>
             </dependencies>
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.codehaus.mojo</groupId>
+                  <artifactId>exec-maven-plugin</artifactId>
+                  <version>3.2.0</version>
+                </plugin>
+              </plugins>
+            </build>
           </project>
           EOF
 
@@ -373,7 +381,7 @@ jobs:
           EOF
 
           export MAVEN_OPTS="-Xmx4g"
-          mvn -f build/gh-builder/pom.xml -q compile exec:java \
+          mvn -B -f build/gh-builder/pom.xml compile exec:java \
             -Dexec.mainClass="BuildGraph" \
             -Dexec.args="$(pwd)/build/israel.osm.pbf $(pwd)/build/map-pack/graphhopper-foot"
 
@@ -384,7 +392,6 @@ jobs:
           echo "Extracting places, streets and house numbers into SQLite..."
 
           cat << 'EOF' > build/build_addresses.py
-          import math
           import sqlite3
           import sys
           import osmium
@@ -434,7 +441,7 @@ jobs:
           def find_nearest_city(lat, lon, cities, city_grid):
               gx, gy = int(lat * 10), int(lon * 10)
               best_name = ""
-              best_d2 = 0.04  # ~20km squared degree threshold
+              best_d2 = 0.04
               for dx in (-2, -1, 0, 1, 2):
                   for dy in (-2, -1, 0, 1, 2):
                       for idx in city_grid.get((gx + dx, gy + dy), ()):
@@ -450,7 +457,7 @@ jobs:
                   super().__init__()
                   self.cities = cities
                   self.city_grid = city_grid
-                  self.streets_acc = {}  # (city, street) -> [sum_lat, sum_lon, count]
+                  self.streets_acc = {}
                   self.addresses = []
 
               def node(self, n):
