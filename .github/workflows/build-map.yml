@@ -1,4 +1,4 @@
-name: Build Offline Israel Vector Map
+name: Build Offline Israel Map Pack
 
 on:
   workflow_dispatch:
@@ -12,17 +12,36 @@ concurrency:
 
 jobs:
   build-and-publish-map:
-    name: Generate israel-basemap.pmtiles
+    name: Generate israel-map-pack.zip
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Create working directory
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies for address indexing
         shell: bash
-        run: mkdir -p build/store
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install osmium
+
+      - name: Create working directories
+        shell: bash
+        run: mkdir -p build/store build/map-pack build/gh-builder/src/main/java
 
       - name: Download latest OpenStreetMap data for Israel
         shell: bash
@@ -33,26 +52,76 @@ jobs:
             "https://download.geofabrik.de/asia/israel-and-palestine-latest.osm.pbf" \
             -o build/israel.osm.pbf
 
-      - name: Prepare map configuration and Lua processing script
+      - name: Download OSM ocean water polygons (with safe fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Downloading OSM water polygons for sea/coastline rendering..."
+          if curl -fL --retry 2 --retry-delay 5 \
+            "https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip" \
+            -o build/water-polygons.zip; then
+            unzip -q build/water-polygons.zip -d build
+            rm -f build/water-polygons.zip
+            echo "HAS_OCEAN=true" >> "$GITHUB_ENV"
+          else
+            echo "Warning: Could not download ocean polygons, continuing with inland water only."
+            echo "HAS_OCEAN=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Prepare Tilemaker configuration and Lua processing script
         shell: bash
         run: |
           set -euo pipefail
 
-          # Create Tilemaker config JSON
-          cat << 'EOF' > build/map_config.json
+          if [ "${HAS_OCEAN}" = "true" ] && [ -f "build/water-polygons-split-4326/water_polygons.shp" ]; then
+            OCEAN_LAYER='"ocean": { "minzoom": 6, "maxzoom": 14, "source": "/data/water-polygons-split-4326/water_polygons.shp", "simplify_below": 12, "simplify_level": 0.0005 },'
+          else
+            OCEAN_LAYER=''
+          fi
+
+          cat << EOF > build/map_config.json
           {
             "layers": {
+              ${OCEAN_LAYER}
+              "water": {
+                "minzoom": 6,
+                "maxzoom": 14,
+                "simplify_below": 12,
+                "simplify_level": 0.0003
+              },
+              "waterway": {
+                "minzoom": 9,
+                "maxzoom": 14,
+                "simplify_below": 12,
+                "simplify_level": 0.0003
+              },
+              "landuse": {
+                "minzoom": 8,
+                "maxzoom": 14,
+                "simplify_below": 12,
+                "simplify_level": 0.0004
+              },
+              "railway": {
+                "minzoom": 8,
+                "maxzoom": 14,
+                "simplify_below": 12,
+                "simplify_level": 0.0002
+              },
               "roads": {
                 "minzoom": 6,
                 "maxzoom": 14,
                 "simplify_below": 13,
-                "simplify_level": 0.0003
+                "simplify_level": 0.00025
+              },
+              "places": {
+                "minzoom": 6,
+                "maxzoom": 14
               }
             },
             "settings": {
               "name": "Israel Offline Basemap",
-              "version": "1.0",
-              "description": "Offline vector roads basemap for Israel",
+              "version": "2.0",
+              "description": "Lightweight offline vector basemap for Israel",
               "minzoom": 6,
               "maxzoom": 14,
               "basezoom": 14,
@@ -62,9 +131,8 @@ jobs:
           }
           EOF
 
-          # Create Tilemaker Lua script
           cat << 'EOF' > build/map_process.lua
-          node_keys = { "name", "name:he", "name:en" }
+          node_keys = { "place", "railway", "amenity", "name", "name:he", "name:en" }
 
           function init_processing()
           end
@@ -72,19 +140,132 @@ jobs:
           function exit_processing()
           end
 
+          local function preferred_name()
+              local name_he = Find("name:he")
+              if name_he ~= "" then return name_he end
+              local name = Find("name")
+              if name ~= "" then return name end
+              local name_en = Find("name:en")
+              return name_en
+          end
+
           function node_function()
+              local place = Find("place")
+              local railway = Find("railway")
+              local amenity = Find("amenity")
+              local label = preferred_name()
+
+              if label == "" then
+                  return
+              end
+
+              if place == "city" then
+                  Layer("places", false)
+                  Attribute("kind", "city")
+                  Attribute("name", label)
+                  MinZoom(6)
+              elseif place == "town" then
+                  Layer("places", false)
+                  Attribute("kind", "town")
+                  Attribute("name", label)
+                  MinZoom(8)
+              elseif place == "village" then
+                  Layer("places", false)
+                  Attribute("kind", "village")
+                  Attribute("name", label)
+                  MinZoom(10)
+              elseif place == "suburb" or place == "quarter" or place == "neighbourhood" then
+                  Layer("places", false)
+                  Attribute("kind", "neighbourhood")
+                  Attribute("name", label)
+                  MinZoom(12)
+              elseif railway == "station" then
+                  Layer("places", false)
+                  Attribute("kind", "train_station")
+                  Attribute("name", label)
+                  MinZoom(11)
+              elseif amenity == "bus_station" then
+                  Layer("places", false)
+                  Attribute("kind", "bus_station")
+                  Attribute("name", label)
+                  MinZoom(12)
+              end
           end
 
           function way_function()
+              local natural = Find("natural")
+              local waterway = Find("waterway")
+              local landuse = Find("landuse")
+              local leisure = Find("leisure")
+              local boundary = Find("boundary")
+              local railway = Find("railway")
               local highway = Find("highway")
+
+              -- Inland water bodies (Kinneret, Dead Sea, reservoirs, pools)
+              if (natural == "water" or landuse == "reservoir" or waterway == "riverbank") and IsClosed() then
+                  Layer("water", true)
+                  Attribute("kind", "water")
+                  MinZoom(6)
+                  return
+              end
+
+              -- Rivers, streams and canals
+              if waterway == "river" or waterway == "canal" then
+                  Layer("waterway", false)
+                  Attribute("kind", "river")
+                  MinZoom(9)
+                  return
+              elseif waterway == "stream" then
+                  Layer("waterway", false)
+                  Attribute("kind", "stream")
+                  MinZoom(12)
+                  return
+              end
+
+              -- Major green areas, parks, forests and nature reserves (skip tiny patches)
+              if (leisure == "park" or leisure == "nature_reserve" or landuse == "forest" or natural == "wood" or boundary == "national_park") and IsClosed() then
+                  local area = Area()
+                  if area > 5000 then
+                      Layer("landuse", true)
+                      if landuse == "forest" or natural == "wood" then
+                          Attribute("kind", "forest")
+                      else
+                          Attribute("kind", "park")
+                      end
+                      if area > 200000 then
+                          MinZoom(8)
+                      elseif area > 30000 then
+                          MinZoom(10)
+                      else
+                          MinZoom(12)
+                      end
+                  end
+                  return
+              end
+
+              -- Railways & Light Rail
+              if railway == "rail" or railway == "light_rail" or railway == "subway" or railway == "tram" then
+                  Layer("railway", false)
+                  Attribute("kind", railway)
+                  if railway == "rail" then
+                      MinZoom(8)
+                  else
+                      MinZoom(11)
+                  end
+                  return
+              end
+
+              -- Roads & Walking paths
               if highway ~= "" then
                   local kind = ""
                   if highway == "motorway" or highway == "trunk" or highway == "primary" then
                       kind = "highway"
                   elseif highway == "secondary" or highway == "tertiary" then
                       kind = "major_road"
-                  elseif highway == "residential" or highway == "unclassified" or highway == "service" or highway == "living_street" then
+                  elseif highway == "residential" or highway == "unclassified" or highway == "living_street" or highway == "road" then
                       kind = "minor_road"
+                  elseif highway == "service" then
+                      kind = "service_road"
                   elseif highway == "footway" or highway == "path" or highway == "pedestrian" or highway == "steps" or highway == "cycleway" or highway == "track" then
                       kind = "path"
                   end
@@ -92,14 +273,16 @@ jobs:
                   if kind ~= "" then
                       Layer("roads", false)
                       Attribute("kind", kind)
-                      
-                      local name_he = Find("name:he")
-                      local name_en = Find("name:en")
-                      local name = Find("name")
-                      
-                      if name_he ~= "" then Attribute("name:he", name_he) end
-                      if name_en ~= "" then Attribute("name:en", name_en) end
-                      if name ~= "" then Attribute("name", name) end
+
+                      local label = preferred_name()
+                      if label ~= "" then
+                          Attribute("name", label)
+                      end
+
+                      local ref = Find("ref")
+                      if ref ~= "" then
+                          Attribute("ref", ref)
+                      end
 
                       if kind == "highway" then
                           MinZoom(6)
@@ -125,37 +308,324 @@ jobs:
             -v "$(pwd)/build:/data" \
             ghcr.io/systemed/tilemaker:master \
             /data/israel.osm.pbf \
-            --output=/data/israel-basemap.pmtiles \
+            --output=/data/map-pack/israel-basemap.pmtiles \
             --config=/data/map_config.json \
             --process=/data/map_process.lua \
             --store=/data/store
 
-      - name: Verify generated map file
+      - name: Generate GraphHopper walking routing graph (8.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Generating GraphHopper 8.0 foot routing graph..."
+
+          cat << 'EOF' > build/gh-builder/pom.xml
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>il.co.israeltransit</groupId>
+            <artifactId>gh-graph-builder</artifactId>
+            <version>1.0.0</version>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+            </properties>
+            <dependencies>
+              <dependency>
+                <groupId>com.graphhopper</groupId>
+                <artifactId>graphhopper-core</artifactId>
+                <version>8.0</version>
+              </dependency>
+              <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-simple</artifactId>
+                <version>2.0.12</version>
+              </dependency>
+            </dependencies>
+          </project>
+          EOF
+
+          cat << 'EOF' > build/gh-builder/src/main/java/BuildGraph.java
+          import com.graphhopper.GraphHopper;
+          import com.graphhopper.config.CHProfile;
+          import com.graphhopper.config.Profile;
+
+          public class BuildGraph {
+              public static void main(String[] args) {
+                  String osmFile = args[0];
+                  String graphDir = args[1];
+
+                  GraphHopper hopper = new GraphHopper();
+                  hopper.setOSMFile(osmFile);
+                  hopper.setGraphHopperLocation(graphDir);
+                  hopper.setProfiles(
+                      new Profile("foot").setVehicle("foot").setWeighting("fastest")
+                  );
+                  hopper.getCHPreparationHandler().setCHProfiles(
+                      new CHProfile("foot")
+                  );
+                  hopper.importOrLoad();
+                  hopper.close();
+                  System.out.println("GraphHopper foot graph generated successfully at: " + graphDir);
+              }
+          }
+          EOF
+
+          export MAVEN_OPTS="-Xmx4g"
+          mvn -f build/gh-builder/pom.xml -q compile exec:java \
+            -Dexec.mainClass="BuildGraph" \
+            -Dexec.args="$(pwd)/build/israel.osm.pbf $(pwd)/build/map-pack/graphhopper-foot"
+
+      - name: Generate offline streets & addresses SQLite database
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Extracting places, streets and house numbers into SQLite..."
+
+          cat << 'EOF' > build/build_addresses.py
+          import math
+          import sqlite3
+          import sys
+          import osmium
+
+          osm_path = sys.argv[1]
+          db_path = sys.argv[2]
+
+          PLACE_TYPES = {"city", "town", "village"}
+          SUB_PLACE_TYPES = {"suburb", "quarter", "neighbourhood"}
+          STREET_HIGHWAYS = {
+              "primary", "secondary", "tertiary", "residential",
+              "unclassified", "living_street", "pedestrian", "service", "road"
+          }
+
+          def pick_name(tags):
+              return (
+                  tags.get("name:he")
+                  or tags.get("name")
+                  or tags.get("name:en")
+                  or ""
+              ).strip()
+
+          class PlaceCollector(osmium.SimpleHandler):
+              def __init__(self):
+                  super().__init__()
+                  self.places = []
+                  self.cities = []
+                  self.city_grid = {}
+
+              def node(self, n):
+                  place = n.tags.get("place")
+                  if not place:
+                      return
+                  if place not in PLACE_TYPES and place not in SUB_PLACE_TYPES:
+                      return
+                  name = pick_name(n.tags)
+                  if not name:
+                      return
+                  lat, lon = n.location.lat, n.location.lon
+                  self.places.append((name, place, lat, lon))
+                  if place in PLACE_TYPES:
+                      idx = len(self.cities)
+                      self.cities.append((name, lat, lon))
+                      key = (int(lat * 10), int(lon * 10))
+                      self.city_grid.setdefault(key, []).append(idx)
+
+          def find_nearest_city(lat, lon, cities, city_grid):
+              gx, gy = int(lat * 10), int(lon * 10)
+              best_name = ""
+              best_d2 = 0.04  # ~20km squared degree threshold
+              for dx in (-2, -1, 0, 1, 2):
+                  for dy in (-2, -1, 0, 1, 2):
+                      for idx in city_grid.get((gx + dx, gy + dy), ()):
+                          cname, clat, clon = cities[idx]
+                          d2 = (lat - clat) ** 2 + (lon - clon) ** 2
+                          if d2 < best_d2:
+                              best_d2 = d2
+                              best_name = cname
+              return best_name
+
+          class StreetAndAddressCollector(osmium.SimpleHandler):
+              def __init__(self, cities, city_grid):
+                  super().__init__()
+                  self.cities = cities
+                  self.city_grid = city_grid
+                  self.streets_acc = {}  # (city, street) -> [sum_lat, sum_lon, count]
+                  self.addresses = []
+
+              def node(self, n):
+                  street = (n.tags.get("addr:street") or "").strip()
+                  housenumber = (n.tags.get("addr:housenumber") or "").strip()
+                  if street and housenumber:
+                      lat, lon = n.location.lat, n.location.lon
+                      city = (n.tags.get("addr:city") or "").strip()
+                      if not city:
+                          city = find_nearest_city(lat, lon, self.cities, self.city_grid)
+                      self.addresses.append((city, street, housenumber, lat, lon))
+
+              def way(self, w):
+                  highway = w.tags.get("highway")
+                  street_addr = (w.tags.get("addr:street") or "").strip()
+                  housenumber = (w.tags.get("addr:housenumber") or "").strip()
+
+                  coords = []
+                  for n in w.nodes:
+                      try:
+                          if n.location.valid():
+                              coords.append((n.location.lat, n.location.lon))
+                      except osmium.InvalidLocationError:
+                          continue
+
+                  if not coords:
+                      return
+
+                  mid_lat, mid_lon = coords[len(coords) // 2]
+
+                  if highway and highway in STREET_HIGHWAYS:
+                      name = pick_name(w.tags)
+                      if name:
+                          city = (w.tags.get("addr:city") or "").strip()
+                          if not city:
+                              city = find_nearest_city(mid_lat, mid_lon, self.cities, self.city_grid)
+                          key = (city, name)
+                          acc = self.streets_acc.get(key)
+                          if acc is None:
+                              self.streets_acc[key] = [mid_lat, mid_lon, 1]
+                          else:
+                              acc[0] += mid_lat
+                              acc[1] += mid_lon
+                              acc[2] += 1
+
+                  if street_addr and housenumber:
+                      avg_lat = sum(c[0] for c in coords) / len(coords)
+                      avg_lon = sum(c[1] for c in coords) / len(coords)
+                      city = (w.tags.get("addr:city") or "").strip()
+                      if not city:
+                          city = find_nearest_city(avg_lat, avg_lon, self.cities, self.city_grid)
+                      self.addresses.append((city, street_addr, housenumber, avg_lat, avg_lon))
+
+          print("Pass 1: Collecting places...")
+          place_handler = PlaceCollector()
+          place_handler.apply_file(osm_path, locations=True)
+          print(f"Found {len(place_handler.places)} places ({len(place_handler.cities)} cities/towns/villages).")
+
+          print("Pass 2: Collecting streets and addresses...")
+          addr_handler = StreetAndAddressCollector(place_handler.cities, place_handler.city_grid)
+          addr_handler.apply_file(osm_path, locations=True)
+          print(f"Found {len(addr_handler.streets_acc)} unique streets and {len(addr_handler.addresses)} addresses.")
+
+          conn = sqlite3.connect(db_path)
+          conn.execute("PRAGMA journal_mode = OFF")
+          conn.execute("PRAGMA synchronous = OFF")
+
+          conn.execute("""
+              CREATE TABLE places (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT NOT NULL,
+                  kind TEXT NOT NULL,
+                  lat REAL NOT NULL,
+                  lon REAL NOT NULL
+              )
+          """)
+
+          conn.execute("""
+              CREATE TABLE streets (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  city TEXT NOT NULL,
+                  street_name TEXT NOT NULL,
+                  lat REAL NOT NULL,
+                  lon REAL NOT NULL
+              )
+          """)
+
+          conn.execute("""
+              CREATE TABLE addresses (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  city TEXT NOT NULL,
+                  street_name TEXT NOT NULL,
+                  house_number TEXT NOT NULL,
+                  lat REAL NOT NULL,
+                  lon REAL NOT NULL
+              )
+          """)
+
+          conn.executemany(
+              "INSERT INTO places (name, kind, lat, lon) VALUES (?, ?, ?, ?)",
+              place_handler.places
+          )
+
+          street_rows = [
+              (city, street, acc[0] / acc[2], acc[1] / acc[2])
+              for (city, street), acc in addr_handler.streets_acc.items()
+          ]
+          conn.executemany(
+              "INSERT INTO streets (city, street_name, lat, lon) VALUES (?, ?, ?, ?)",
+              street_rows
+          )
+
+          conn.executemany(
+              "INSERT INTO addresses (city, street_name, house_number, lat, lon) VALUES (?, ?, ?, ?, ?)",
+              addr_handler.addresses
+          )
+
+          conn.execute("CREATE INDEX idx_places_name ON places(name)")
+          conn.execute("CREATE INDEX idx_streets_name ON streets(street_name, city)")
+          conn.execute("CREATE INDEX idx_streets_city ON streets(city, street_name)")
+          conn.execute("CREATE INDEX idx_addresses_lookup ON addresses(street_name, city, house_number)")
+
+          conn.commit()
+          conn.execute("ANALYZE")
+          conn.execute("VACUUM")
+          conn.close()
+          print("Address database built successfully.")
+          EOF
+
+          python build/build_addresses.py build/israel.osm.pbf build/map-pack/israel-addresses.sqlite
+
+      - name: Bundle and verify israel-map-pack.zip
         shell: bash
         run: |
           set -euo pipefail
 
-          MAP="build/israel-basemap.pmtiles"
-          if [ ! -f "$MAP" ]; then
-            echo "Error: Map file was not created."
+          PMTILES="build/map-pack/israel-basemap.pmtiles"
+          GH_DIR="build/map-pack/graphhopper-foot"
+          ADDR_DB="build/map-pack/israel-addresses.sqlite"
+
+          if [ ! -f "$PMTILES" ]; then
+            echo "Error: PMTiles file missing."
             exit 1
           fi
 
-          SIZE=$(stat -c%s "$MAP")
-          echo "Generated map file size: $SIZE bytes"
-
-          if [ "$SIZE" -lt 5000000 ]; then
-            echo "Error: Generated map is suspiciously small ($SIZE bytes)."
-            exit 1
-          fi
-
-          HEADER=$(head -c 7 "$MAP")
+          HEADER=$(head -c 7 "$PMTILES")
           if [ "$HEADER" != "PMTiles" ]; then
-            echo "Error: File does not have PMTiles header."
+            echo "Error: Invalid PMTiles header."
             exit 1
           fi
 
-          echo "Map validation passed successfully."
+          if [ ! -d "$GH_DIR" ] || [ -z "$(ls -A "$GH_DIR")" ]; then
+            echo "Error: GraphHopper foot graph missing."
+            exit 1
+          fi
+
+          if [ ! -f "$ADDR_DB" ]; then
+            echo "Error: Addresses SQLite missing."
+            exit 1
+          fi
+
+          echo "Individual file sizes before packaging:"
+          du -sh "$PMTILES" "$GH_DIR" "$ADDR_DB"
+
+          (cd build/map-pack && zip -r ../israel-map-pack.zip .)
+
+          PACK="build/israel-map-pack.zip"
+          PACK_SIZE=$(stat -c%s "$PACK")
+          echo "Final israel-map-pack.zip size: $PACK_SIZE bytes"
+          ls -lh "$PACK"
+
+          if [ "$PACK_SIZE" -lt 10000000 ]; then
+            echo "Error: Final map pack is suspiciously small."
+            exit 1
+          fi
 
       - name: Publish dedicated offline-map release
         shell: bash
@@ -167,16 +637,16 @@ jobs:
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Updating existing $TAG release..."
-            gh release upload "$TAG" build/israel-basemap.pmtiles --clobber
+            gh release upload "$TAG" build/israel-map-pack.zip --clobber
           else
             echo "Creating new dedicated $TAG release..."
             gh release create "$TAG" \
-              build/israel-basemap.pmtiles \
-              --title "מפה לא מקוונת (PMTiles)" \
-              --notes "קובץ מפה וקטורית עדכני לישראל בפורמט PMTiles v3 (עבור רחובות, שבילים וכבישים)."
+              build/israel-map-pack.zip \
+              --title "חבילת מפה וניווט לא מקוונת" \
+              --notes "חבילה מאוחדת לישראל הכוללת מפה וקטורית (PMTiles), מנוע הליכה (GraphHopper) ואינדקס רחובות וכתובות."
           fi
 
-          echo "Map release published under tag: $TAG"
+          echo "Map pack published under tag: $TAG"
 
       - name: Clean up temporary files
         if: always()
